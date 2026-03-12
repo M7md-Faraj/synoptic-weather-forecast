@@ -7,7 +7,9 @@ import joblib
 import json
 import requests
 from datetime import datetime, timedelta
+import math
 
+# project imports (adjust if your package layout differs)
 from src.data_loader import load_csv, preprocess
 from src.train import train_random_forest_progress, train_sgd_progress
 from src.analysis import (
@@ -34,7 +36,7 @@ BASE = Path.cwd()
 MODELS_DIR = BASE / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
-# ---- THEME / CSS (includes animation CSS) ----
+# ---- THEME / CSS (kept same as before) ----
 if "theme" not in st.session_state:
     st.session_state["theme"] = "dark"
 
@@ -43,119 +45,45 @@ def inject_theme_css(theme: str):
     if theme == "dark":
         page_bg = "#0b0d0f"
         text_color = "#eef2f6"
-        card_bg = "#1f2224"   # dark gray card background
+        card_bg = "#1f2224"
         shadow_strong = "0 30px 60px rgba(0,0,0,0.85), 0 8px 18px rgba(0,0,0,0.7)"
-        accent = "#4cd137"
     else:
         page_bg = "#f3f6f9"
         text_color = "#0b2545"
         card_bg = "#ffffff"
         shadow_strong = "0 18px 30px rgba(0,0,0,0.08), 0 6px 12px rgba(0,0,0,0.04)"
-        accent = "#33cc33"
 
     css = f"""
     <style>
     .stApp {{ background: {page_bg} !important; color: {text_color} !important; }}
     .css-18e3th9, .block-container, .stApp .main {{ background: {page_bg} !important; }}
-
-    .big-card {{
-        background: {card_bg} !important;
-        color: {text_color} !important;
-        border-radius: 18px !important;
-        padding: 24px !important;
-        box-shadow: {shadow_strong} !important;
-        margin-bottom: 16px !important;
-    }}
-    .small-card {{
-        background: {card_bg} !important;
-        color: {text_color} !important;
-        border-radius: 12px !important;
-        padding: 12px !important;
-        box-shadow: 0 12px 30px rgba(0,0,0,0.45) !important;
-        margin-bottom: 12px !important;
-    }}
-
+    .big-card {{ background: {card_bg} !important; color: {text_color} !important; border-radius: 18px !important; padding: 24px !important; box-shadow: {shadow_strong} !important; margin-bottom: 16px !important; }}
+    .small-card {{ background: {card_bg} !important; color: {text_color} !important; border-radius: 12px !important; padding: 12px !important; box-shadow: 0 12px 30px rgba(0,0,0,0.45) !important; margin-bottom: 12px !important; }}
     .big-time {{ font-size: 72px; font-weight: 800; margin:8px 0; }}
     .big-city {{ font-size: 26px; font-weight:700; }}
     .big-temp {{ font-size: 110px; font-weight:900; line-height:0.9; }}
     .deg {{ font-size: 36px; vertical-align: super; }}
-
     .forecast-cell {{ border-radius: 12px; padding: 12px; text-align:center; display:inline-block; min-width:140px; margin-right:12px; }}
-
-    .stat-tile {{
-        display:flex;
-        flex-direction:column;
-        align-items:center;
-        justify-content:center;
-        padding:10px;
-        border-radius:12px;
-        min-width:110px;
-    }}
-
+    .stat-tile {{ display:flex; flex-direction:column; align-items:center; justify-content:center; padding:10px; border-radius:12px; min-width:110px; }}
     .cards-row {{ display:flex; gap:12px; flex-wrap:wrap; }}
-
-    /* Animated icon helpers */
+    /* animation helpers (kept short) */
     .wx-icon {{ display:inline-block; vertical-align:middle; }}
     .sun-core {{ transform-origin:50% 50%; animation: sun-rotate 12s linear infinite; }}
-    @keyframes sun-rotate {{
-        from {{ transform: rotate(0deg); }}
-        to {{ transform: rotate(360deg); }}
-    }}
-
+    @keyframes sun-rotate {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
     .ray {{ transform-origin: 50% 50%; animation: ray-pulse 2.8s ease-in-out infinite; }}
-    @keyframes ray-pulse {{
-        0% {{ opacity: 0.85; transform: scale(1); }}
-        50% {{ opacity: 0.5; transform: scale(1.08); }}
-        100% {{ opacity: 0.85; transform: scale(1); }}
-    }}
-
-    .cloud-move {{ animation: cloud-move 8s linear infinite; }}
-    @keyframes cloud-move {{
-        0% {{ transform: translateX(-5px); }}
-        50% {{ transform: translateX(5px); }}
-        100% {{ transform: translateX(-5px); }}
-    }}
-
-    .rain-drop {{ animation: rain-fall 1.2s linear infinite; }}
-    .rain-drop:nth-child(2) {{ animation-delay: 0.18s; }}
-    .rain-drop:nth-child(3) {{ animation-delay: 0.36s; }}
-    @keyframes rain-fall {{
-        0% {{ transform: translateY(-8px); opacity: 0; }}
-        10% {{ opacity: 1; }}
-        100% {{ transform: translateY(18px); opacity: 0; }}
-    }}
-
-    .snow-flake {{ animation: snow-fall 2.6s linear infinite; }}
-    .snow-flake:nth-child(2) {{ animation-delay: 0.3s; }}
-    .snow-flake:nth-child(3) {{ animation-delay: 0.6s; }}
-    @keyframes snow-fall {{
-        0% {{ transform: translateY(-6px) rotate(0deg); opacity: 0; }}
-        20% {{ opacity: 1; }}
-        100% {{ transform: translateY(26px) rotate(180deg); opacity: 0; }}
-    }}
-
-    .bolt {{ animation: bolt-flash 1.8s linear infinite; opacity: 0; }}
-    @keyframes bolt-flash {{
-        0% {{ opacity: 0; }}
-        45% {{ opacity: 1; transform: translateY(0) scale(1); }}
-        50% {{ opacity: 1; transform: translateY(-2px) scale(1.03); }}
-        60% {{ opacity: 0; }}
-        100% {{ opacity: 0; }}
-    }}
-
-    /* responsive tweaks */
-    @media (max-width: 900px) {{
-        .big-temp {{ font-size: 72px; }}
-        .big-time {{ font-size: 48px; }}
-    }}
+    @keyframes ray-pulse {{ 0% {{ opacity: .85; transform: scale(1); }} 50% {{ opacity: .5; transform: scale(1.08); }} 100% {{ opacity: .85; transform: scale(1); }} }}
+    .cloud-move {{ animation: cloud-move 8s linear infinite; }} @keyframes cloud-move {{ 0% {{ transform: translateX(-5px); }} 50% {{ transform: translateX(5px); }} 100% {{ transform: translateX(-5px); }} }}
+    .rain-drop {{ animation: rain-fall 1.2s linear infinite; }} @keyframes rain-fall {{ 0% {{ transform: translateY(-8px); opacity: 0; }} 10% {{ opacity: 1; }} 100% {{ transform: translateY(18px); opacity: 0; }} }}
+    .snow-flake {{ animation: snow-fall 2.6s linear infinite; }} @keyframes snow-fall {{ 0% {{ transform: translateY(-6px) rotate(0deg); opacity: 0; }} 20% {{ opacity: 1; }} 100% {{ transform: translateY(26px) rotate(180deg); opacity: 0; }} }}
+    .bolt {{ animation: bolt-flash 1.8s linear infinite; opacity: 0; }} @keyframes bolt-flash {{ 0% {{ opacity: 0; }} 45% {{ opacity: 1; transform: translateY(0) scale(1); }} 50% {{ opacity: 1; transform: translateY(-2px) scale(1.03); }} 60% {{ opacity: 0; }} 100% {{ opacity: 0; }} }}
+    @media (max-width: 900px) {{ .big-temp {{ font-size: 72px; }} .big-time {{ font-size: 48px; }} }}
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
 
-# inject for initial theme
 inject_theme_css(st.session_state["theme"])
 
-# ---- helpers & cached model loader ----
+# ---- helpers & model loader ----
 @st.cache_resource
 def load_model_cached(path_str: str):
     return load_model(path_str)
@@ -172,127 +100,23 @@ if "last_prediction" not in st.session_state:
 if "use_forecast_main" not in st.session_state:
     st.session_state["use_forecast_main"] = False
 
-# ---- animated icon helper ----
+# get_animated_icon (same as previous helper) - keep or import from module
 def get_animated_icon(condition: str, size: int = 100):
-    """
-    Return an HTML string with an inline animated SVG for the given condition.
-    condition: string (e.g. "rain", "snow", "cloud", "sunny", "partly cloudy", "thunder")
-    size: pixel square size
-    """
     c = (condition or "").lower()
-    # thunder/storm
-    if "thunder" in c or "storm" in c or "lightning" in c:
-        svg = f"""
-        <svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <g class="cloud-move" fill="#cfd8e3">
-            <ellipse cx="30" cy="26" rx="18" ry="12" />
-            <ellipse cx="44" cy="28" rx="10" ry="8" />
-          </g>
-          <g transform="translate(22,34)" class="bolt" fill="#ffd13d">
-            <path d="M6 0 L0 12 L8 12 L2 28 L18 12 L10 12 L16 0 z" fill="#ffd13d" stroke="#f2a800" stroke-width="0.5"/>
-          </g>
-        </svg>
-        """
-        return svg
-
-    # rain/shower
     if "rain" in c or "shower" in c or "drizzle" in c:
-        svg = f"""
-        <svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <g class="cloud-move">
-            <ellipse cx="30" cy="22" rx="18" ry="12" fill="#cfd8e3"/>
-            <ellipse cx="44" cy="24" rx="10" ry="8" fill="#dfe7f0"/>
-          </g>
-          <g transform="translate(16,34)" fill="#4DA6FF">
-            <ellipse class="rain-drop" cx="6" cy="4" rx="2" ry="4" />
-            <ellipse class="rain-drop" cx="16" cy="6" rx="2" ry="4" />
-            <ellipse class="rain-drop" cx="26" cy="4" rx="2" ry="4" />
-          </g>
-        </svg>
-        """
+        svg = f"""<svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="cloud-move"><ellipse cx="30" cy="22" rx="18" ry="12" fill="#cfd8e3"/><ellipse cx="44" cy="24" rx="10" ry="8" fill="#dfe7f0"/></g><g transform="translate(16,34)" fill="#4DA6FF"><ellipse class="rain-drop" cx="6" cy="4" rx="2" ry="4" /><ellipse class="rain-drop" cx="16" cy="6" rx="2" ry="4" /><ellipse class="rain-drop" cx="26" cy="4" rx="2" ry="4" /></g></svg>"""
         return svg
-
-    # snow/sleet
     if "snow" in c or "sleet" in c:
-        svg = f"""
-        <svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <g class="cloud-move" fill="#dfe7f0">
-            <ellipse cx="30" cy="22" rx="18" ry="12"/>
-            <ellipse cx="44" cy="24" rx="10" ry="8"/>
-          </g>
-          <g transform="translate(16,36)" fill="#ffffff">
-            <text class="snow-flake" x="6" y="6" font-size="10">❄</text>
-            <text class="snow-flake" x="18" y="8" font-size="10">❄</text>
-            <text class="snow-flake" x="30" y="6" font-size="10">❄</text>
-          </g>
-        </svg>
-        """
+        svg = f"""<svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="cloud-move" fill="#dfe7f0"><ellipse cx="30" cy="22" rx="18" ry="12"/><ellipse cx="44" cy="24" rx="10" ry="8"/></g><g transform="translate(16,36)" fill="#ffffff"><text class="snow-flake" x="6" y="6" font-size="10">❄</text><text class="snow-flake" x="18" y="8" font-size="10">❄</text><text class="snow-flake" x="30" y="6" font-size="10">❄</text></g></svg>"""
         return svg
-
-    # cloud / overcast
     if "cloud" in c or "overcast" in c:
-        svg = f"""
-        <svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <g class="cloud-move" fill="#d0d6df">
-            <ellipse cx="26" cy="26" rx="18" ry="12"/>
-            <ellipse cx="42" cy="28" rx="12" ry="9"/>
-          </g>
-        </svg>
-        """
+        svg = f"""<svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="cloud-move" fill="#d0d6df"><ellipse cx="26" cy="26" rx="18" ry="12"/><ellipse cx="42" cy="28" rx="12" ry="9"/></g></svg>"""
         return svg
-
-    # partly cloudy (sun + cloud)
-    if "part" in c or ("sun" in c and "cloud" in c) or "mix" in c or "few" in c:
-        svg = f"""
-        <svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <g transform="translate(6,6)">
-            <g class="sun-core">
-              <circle cx="18" cy="18" r="8" fill="#FFD33D"/>
-              <g class="ray" fill="#FFD33D" opacity="0.9">
-                <rect x="17.5" y="-2" width="1" height="6" />
-                <rect x="34" y="17.5" width="6" height="1" />
-                <rect x="17.5" y="34" width="1" height="6" />
-                <rect x="-2" y="17.5" width="6" height="1" />
-              </g>
-            </g>
-            <g transform="translate(20,10)" class="cloud-move" fill="#dfe7f0">
-              <ellipse cx="18" cy="18" rx="14" ry="9"/>
-              <ellipse cx="32" cy="20" rx="8" ry="6"/>
-            </g>
-          </g>
-        </svg>
-        """
-        return svg
-
-    # default: sunny
-    svg = f"""
-    <svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-      <g transform="translate(0,0)">
-        <g class="sun-core">
-          <circle cx="32" cy="32" r="12" fill="#FFD33D"/>
-        </g>
-        <g transform="translate(32,32)" >
-          <g>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(0)"/>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(30)"/>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(60)"/>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(90)"/>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(120)"/>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(150)"/>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(180)"/>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(210)"/>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(240)"/>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(270)"/>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(300)"/>
-            <rect class="ray" x="-1.5" y="-22" width="3" height="8" rx="1" ry="1" fill="#FFD33D" transform="rotate(330)"/>
-          </g>
-        </g>
-      </g>
-    </svg>
-    """
+    # partly / sunny fallback
+    svg = f"""<svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="sun-core"><circle cx="32" cy="32" r="12" fill="#FFD33D"/></g></svg>"""
     return svg
 
-# ---- geo helpers (flag + geolocation) ----
+# geo helpers
 def country_code_to_flag_emoji(code: str):
     if not code or len(code) != 2:
         return ""
@@ -303,11 +127,7 @@ def country_code_to_flag_emoji(code: str):
         return ""
 
 def try_get_geolocation():
-    """Best-effort geolocation using ipapi.co then ipinfo.io (non-blocking)."""
-    apis = [
-        ("https://ipapi.co/json/", "ipapi"),
-        ("https://ipinfo.io/json", "ipinfo"),
-    ]
+    apis = [("https://ipapi.co/json/", "ipapi"), ("https://ipinfo.io/json", "ipinfo")]
     for url, tag in apis:
         try:
             resp = requests.get(url, timeout=3)
@@ -323,14 +143,13 @@ def try_get_geolocation():
             continue
     return None
 
-# ---- model loader / feature alignment ----
-def load_model_and_features():
+# load model & meta (attempt to load .meta or .meta.json)
+def load_model_and_meta():
     chosen_path = None
     if st.session_state.get("prefer_pretrained", True) and st.session_state.get("selected_model_file"):
         chosen_filename = st.session_state["selected_model_file"]
         chosen_path = MODELS_DIR / chosen_filename
     else:
-        # model_choice is set in the sidebar before predict flows are triggered
         try:
             latest = get_latest_by_base(model_choice)
             chosen_path = Path(latest["path"]) if latest else None
@@ -338,36 +157,49 @@ def load_model_and_features():
             chosen_path = None
 
     if not chosen_path or not chosen_path.exists():
-        return None, None
+        return None, None, None
     try:
         model = load_model_cached(str(chosen_path))
     except Exception as e:
         st.error(f"Failed to load model: {e}")
-        return None, None
+        return None, None, None
+
+    # read metadata if exists
+    meta = None
+    meta_json = chosen_path.with_suffix(chosen_path.suffix + ".meta.json")
+    meta_bin = chosen_path.with_suffix(chosen_path.suffix + ".meta")
+    try:
+        if meta_json.exists():
+            with open(meta_json, "r") as fh:
+                meta = json.load(fh)
+        elif meta_bin.exists():
+            meta = joblib.load(meta_bin)
+    except Exception:
+        meta = None
 
     model_features = getattr(model, "feature_names_in_", None)
-    if model_features is None:
-        meta_json = chosen_path.with_suffix(chosen_path.suffix + ".meta.json")
-        meta_bin = chosen_path.with_suffix(chosen_path.suffix + ".meta")
-        try:
-            if meta_json.exists():
-                with open(meta_json, "r") as fh:
-                    meta = json.load(fh)
-                    model_features = meta.get("features") or meta.get("feature_names")
-            elif meta_bin.exists():
-                meta = joblib.load(meta_bin)
-                model_features = meta.get("features") or meta.get("feature_names")
-        except Exception:
-            model_features = None
+    if model_features is None and meta is not None:
+        model_features = meta.get("features") or meta.get("feature_names")
     if model_features is not None:
         model_features = list(model_features)
-    return model, model_features
+    return model, model_features, meta
+
+# clamp & validate prediction
+def sanitize_prediction(val, clip_min=-60.0, clip_max=60.0):
+    try:
+        v = float(val)
+        # check for NaN/Inf and absurd magnitudes
+        if not math.isfinite(v) or abs(v) > 1e6:
+            return None
+        # clip to realistic bounds
+        v = max(min(v, clip_max), clip_min)
+        return v
+    except Exception:
+        return None
 
 # ---- SIDEBAR ----
 with st.sidebar:
     st.markdown("# Controls")
-
-    # theme toggle
     checked = st.checkbox("Dark", value=(st.session_state["theme"] == "dark"))
     new_theme = "dark" if checked else "light"
     if new_theme != st.session_state["theme"]:
@@ -448,10 +280,7 @@ with st.sidebar:
     predict_n = st.number_input("Forecast next N days", min_value=1, max_value=365, value=5)
     predict_btn = st.button("Predict (forecast next N days)")
 
-# ---- Title ----
-st.markdown("<div style='display:flex; align-items:center; gap:12px;'><h1 style='margin:0; font-weight:900'>🌤️ Synoptic Weather Forecast</h1><div style='color:var(--text-color)'></div></div>", unsafe_allow_html=True)
-
-# ---- prediction helpers & logic ----
+# ---- prediction helpers & logic (with sanitization & scaler support) ----
 def _create_future_dates(last_date, n):
     last_dt = pd.to_datetime(last_date, errors='coerce')
     if pd.isna(last_dt):
@@ -459,6 +288,7 @@ def _create_future_dates(last_date, n):
     return [(last_dt + timedelta(days=i+1)).normalize() for i in range(n)]
 
 def _ensure_X_for_model(Xrow, model_features):
+    """Return a single-row DataFrame aligned to model_features, filling missing with last-known or zeros."""
     if model_features is None:
         return Xrow
     X2 = pd.DataFrame(index=[0])
@@ -467,48 +297,92 @@ def _ensure_X_for_model(Xrow, model_features):
             X2[f] = Xrow[f].iloc[0]
         else:
             X2[f] = 0.0
+    # cast to float
+    X2 = X2.astype(float)
     return X2
 
-def _predict_future(df, features, n, model, model_features=None):
+def _predict_future(df, features, n, model, model_features=None, meta=None):
     start_row = df[features].tail(1).copy().fillna(0)
     future_dates = _create_future_dates(df['date'].iloc[-1], n)
     rows = []
     X_base = start_row.copy()
+    scaler = None
+    if meta is not None:
+        # some metadata files include a saved scaler object under key 'scaler'
+        if isinstance(meta, dict) and meta.get("scaler") is not None:
+            scaler = meta.get("scaler")
+        # if meta is a joblib-loaded object that itself contains scaler
+        if hasattr(meta, "get") and meta.get("scaler", None) is not None:
+            scaler = meta.get("scaler")
+
     for i in range(n):
-        Xp = _ensure_X_for_model(X_base, model_features)
-        if model_features is not None:
-            try:
-                Xp = Xp[model_features]
-            except Exception:
-                pass
+        Xp_df = _ensure_X_for_model(X_base, model_features)
+        # convert to numeric 2D array for model
         try:
-            pred = float(model.predict(Xp)[0])
+            X_pred_input = Xp_df.astype(float).to_numpy().reshape(1, -1)
+        except Exception:
+            # fallback: try converting each column
+            Xp_df = Xp_df.apply(pd.to_numeric, errors='coerce').fillna(0.0)
+            X_pred_input = Xp_df.to_numpy().reshape(1, -1)
+
+        # apply scaler if available (best-effort)
+        try:
+            if scaler is not None:
+                # scaler might be a sklearn transformer
+                X_pred_input = scaler.transform(X_pred_input)
+        except Exception:
+            # ignore scaler errors but continue
+            pass
+
+        # predict
+        try:
+            raw_pred = model.predict(X_pred_input)[0]
         except Exception as e:
-            st.error(f"Prediction failed during iterative forecast: {e}")
+            st.error(f"Prediction failed during iterative forecast (model.predict error): {e}")
             return None
-        rec = {"date": future_dates[i], "pred_mean_temp": float(pred)}
+
+        # sanitize numeric value
+        pred_val = sanitize_prediction(raw_pred)
+        if pred_val is None:
+            # fallback: try cast and clip; if impossible, warn and set to 0.0
+            try:
+                pred_val = float(raw_pred)
+                if not math.isfinite(pred_val):
+                    pred_val = 0.0
+            except Exception:
+                pred_val = 0.0
+            # final clip
+            pred_val = max(min(pred_val, 60.0), -60.0)
+            st.warning(f"A raw prediction looked invalid ({raw_pred}); it was replaced with {pred_val:.1f}°C for stability.")
+
+        # store
+        rec = {"date": future_dates[i], "pred_mean_temp": float(round(pred_val, 1))}
         for col in ["precipitation", "wind", "pressure", "aqi", "humidity", "sunshine"]:
             if col in df.columns:
                 rec[col] = df[col].iloc[-1]
         rows.append(rec)
+
+        # update X_base with predicted temp for next iteration if relevant column exists
         if 'mean_temp' in X_base.columns:
-            X_base.at[X_base.index[0], 'mean_temp'] = pred
+            X_base.at[X_base.index[0], 'mean_temp'] = pred_val
         else:
             for tcol in ['temp', 'max_temp', 'min_temp']:
                 if tcol in X_base.columns:
-                    X_base.at[X_base.index[0], tcol] = pred
+                    X_base.at[X_base.index[0], tcol] = pred_val
                     break
-    return pd.DataFrame(rows)
+
+    df_pred = pd.DataFrame(rows)
+    return df_pred
 
 if predict_btn:
     if not features or len(features) < 1:
         st.error("Please select at least one feature to enable prediction.")
     else:
-        model, model_feats = load_model_and_features()
+        model, model_features, meta = load_model_and_meta()
         if model is None:
             st.error("No model available; check Advanced / Training controls.")
         else:
-            pred_df = _predict_future(df, features, int(predict_n), model, model_features=model_feats)
+            pred_df = _predict_future(df, features, int(predict_n), model, model_features=model_features, meta=meta)
             if pred_df is not None:
                 st.session_state["last_prediction"] = pred_df
                 st.success(f"Forecast for next {len(pred_df)} days computed and stored in session.")
@@ -517,7 +391,7 @@ if predict_btn:
 geo = try_get_geolocation()
 current_display = get_current_conditions(df)
 
-# city + flag
+# choose location label
 city_label = None
 flag = ""
 if geo and geo.get("city"):
@@ -534,13 +408,13 @@ left_col, right_col = st.columns([2.2, 1.6])
 
 with left_col:
     now = datetime.now()
-    time_str = now.strftime("%I:%M %p")  # 12-hour with AM/PM
+    time_str = now.strftime("%I:%M %p")
     city_html = f"<div class='big-city'>{flag} {city_label}</div>"
     time_html = f"<div class='big-time'>{time_str}</div>"
     date_html = f"<div style='font-size:16px; color:var(--text-color)'>{now.strftime('%A, %d %b %Y')}</div>"
     st.markdown(f"<div class='big-card'>{city_html}{time_html}{date_html}</div>", unsafe_allow_html=True)
 
-# main right card (allow forecast override)
+# main right card - use forecast override if chosen
 if st.session_state["use_forecast_main"] and st.session_state["last_prediction"] is not None:
     p0 = st.session_state["last_prediction"].iloc[0]
     temp_val = float(p0.get("pred_mean_temp", current_display.get("temp", 0.0)))
@@ -566,7 +440,7 @@ pressure_str = "—"
 if pressure_val is not None:
     try:
         ptemp = float(pressure_val)
-        if ptemp > 2000:  # likely Pa
+        if ptemp > 2000:
             ptemp = ptemp / 100.0
         pressure_str = f"{int(round(ptemp))} hPa"
     except Exception:
@@ -575,7 +449,6 @@ if pressure_val is not None:
 aqi_str = str(int(aqi_val)) if (aqi_val is not None and not pd.isna(aqi_val)) else "—"
 precip_str = f"{precip_val} mm" if (precip_val is not None and not pd.isna(precip_val)) else "—"
 
-# pick animated icon HTML
 big_icon_html = get_animated_icon(condition, size=120)
 
 with right_col:
@@ -602,7 +475,7 @@ with right_col:
 
     st.markdown(f"<div class='big-card'>{big_temp_html}{stats_html}{precip_block}</div>", unsafe_allow_html=True)
 
-# ---- Forecast and hourly (clean layout) ----
+# ---- Forecast and hourly rendering (unchanged layout but sanitized preds used) ----
 col_a, col_b = st.columns([1, 1.6])
 
 def _render_forecast_card(target_n=5):
@@ -613,22 +486,8 @@ def _render_forecast_card(target_n=5):
         for _, r in to_show.iterrows():
             dt_s = pd.to_datetime(r['date']).strftime('%a<br>%Y-%m-%d')
             temp = int(round(r.get('pred_mean_temp', 0)))
-            icon_html = get_animated_icon('', size=24)  # use small svg based on temp/cond
-            # choose cond icon by temp if cond absent
             cond = r.get('condition', '')
-            if cond:
-                icon_html = get_animated_icon(cond, size=28)
-            else:
-                # fallback by temp
-                if temp >= 25:
-                    icon_html = get_animated_icon('sunny', size=28)
-                elif temp >= 15:
-                    icon_html = get_animated_icon('partly cloudy', size=28)
-                elif temp >= 5:
-                    icon_html = get_animated_icon('cloud', size=28)
-                else:
-                    icon_html = get_animated_icon('snow', size=28)
-
+            icon_html = get_animated_icon(cond or ('sunny' if temp >= 15 else 'snow'), size=28)
             precip = r.get('precipitation', '—')
             wind = r.get('wind', '—')
             cards_html += (

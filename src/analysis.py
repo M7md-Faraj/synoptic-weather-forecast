@@ -1,5 +1,6 @@
 """
-Analysis helpers for the dashboard.
+Analysis helpers for the dashboard. Improved get_current_conditions to
+derive humidity/wind when missing using simple heuristics.
 """
 
 import pandas as pd
@@ -83,10 +84,8 @@ def build_5day_forecast(df: pd.DataFrame):
         return out
 
     df_sorted = df.copy()
-    # try common formats: ISO and also YYYYMMDD fallback
     parsed = pd.to_datetime(df_sorted['date'], errors='coerce', infer_datetime_format=True)
     if parsed.isna().all():
-        # try explicit YYYYMMDD format
         try:
             parsed = pd.to_datetime(df_sorted['date'], format='%Y%m%d', errors='coerce')
         except Exception:
@@ -104,7 +103,6 @@ def build_5day_forecast(df: pd.DataFrame):
     return out
 
 def build_hourly_preview(df: pd.DataFrame, n=5):
-    """Return a simple hourly preview from historical data (or fallback)."""
     out = []
     if 'time' in df.columns:
         sample = df.sort_values('date').tail(n)
@@ -122,7 +120,12 @@ def build_hourly_preview(df: pd.DataFrame, n=5):
     return out
 
 def get_current_conditions(df: pd.DataFrame):
-    """Gather a cleaned dictionary of current/historical conditions from the last row."""
+    """Gather a cleaned dictionary of current/historical conditions from the last row.
+    Heuristics:
+    - try many column names for humidity/wind/pressure/aqi
+    - if humidity missing and cloud_cover exists (0-10 or 0-1 scale), estimate humidity = cloud_cover * scale
+    - if wind missing, estimate from inverse cloud_cover or global_radiation if available
+    """
     if df is None or df.shape[0] == 0:
         now = datetime.now()
         return {
@@ -140,13 +143,10 @@ def get_current_conditions(df: pd.DataFrame):
             'city': 'Unknown'
         }
 
-    # robust parse for date column
     df_sorted = df.copy()
     try:
-        # try parsing directly with infer
         parsed = pd.to_datetime(df_sorted['date'], errors='coerce', infer_datetime_format=True)
         if parsed.isna().all():
-            # try explicit %Y%m%d if dataset like 19790101
             parsed = pd.to_datetime(df_sorted['date'], format='%Y%m%d', errors='coerce')
     except Exception:
         parsed = pd.to_datetime(df_sorted['date'], errors='coerce')
@@ -157,6 +157,7 @@ def get_current_conditions(df: pd.DataFrame):
     time_str = pd.to_datetime(dt).strftime('%I:%M %p')
     date_str = pd.to_datetime(dt).strftime('%A, %d %b %Y')
 
+    # temperature selection
     temp = None
     for tcol in ['mean_temp', 'temp', 'max_temp', 'min_temp']:
         if tcol in r.index and not pd.isna(r.get(tcol)):
@@ -169,6 +170,7 @@ def get_current_conditions(df: pd.DataFrame):
     if pd.isna(feels_like) or feels_like is None:
         feels_like = temp
 
+    # condition inference
     condition = None
     for ccol in ['weather', 'condition', 'summary', 'cloud_cover']:
         if ccol in r.index and not pd.isna(r.get(ccol)):
@@ -176,9 +178,14 @@ def get_current_conditions(df: pd.DataFrame):
             if ccol == 'cloud_cover':
                 try:
                     cc = float(val)
-                    if cc > 7:
+                    # interpret cloud_cover as 0-10 scale or 0-1
+                    if cc <= 1:
+                        cc10 = cc * 10
+                    else:
+                        cc10 = cc
+                    if cc10 > 7:
                         condition = 'Cloudy'
-                    elif cc > 3:
+                    elif cc10 > 3:
                         condition = 'Partly cloudy'
                     else:
                         condition = 'Clear'
@@ -190,6 +197,7 @@ def get_current_conditions(df: pd.DataFrame):
     if condition is None:
         condition = 'Unknown'
 
+    # sunrise/sunset fallbacks
     sunrise = r.get('sunrise', None)
     sunset = r.get('sunset', None)
     if sunrise is None or pd.isna(sunrise):
@@ -197,22 +205,48 @@ def get_current_conditions(df: pd.DataFrame):
     if sunset is None or pd.isna(sunset):
         sunset = '18:30'
 
+    # humidity attempt many names
     humidity = None
     for hcol in ['humidity', 'rel_humidity', 'rh', 'wet_bulb']:
         if hcol in r.index and not pd.isna(r.get(hcol)):
             humidity = r.get(hcol)
             break
+    # fallback: estimate from cloud_cover if present
     if humidity is None:
-        humidity = 0
+        if 'cloud_cover' in r.index and not pd.isna(r.get('cloud_cover')):
+            try:
+                cc = float(r.get('cloud_cover'))
+                # if cloud_cover seems 0-1 scale, convert to 0-10
+                cc10 = cc * 10 if cc <= 1 else cc
+                humidity = int(min(100, max(0, round(cc10 * 10))))
+            except Exception:
+                humidity = 50
+        else:
+            humidity = 50  # neutral fallback
 
+    # wind attempt many names
     wind = None
-    for wcol in ['wind', 'wind_speed', 'wind_kph', 'wind_km_h']:
+    for wcol in ['wind', 'wind_speed', 'wind_kph', 'wind_km_h', 'wind_mph']:
         if wcol in r.index and not pd.isna(r.get(wcol)):
             wind = r.get(wcol)
             break
+    # fallback: estimate inversely from cloud_cover or use global_radiation: less clouds -> calmer? We'll do simple heuristic
     if wind is None:
-        wind = 0
+        try:
+            if 'cloud_cover' in r.index and not pd.isna(r.get('cloud_cover')):
+                cc = float(r.get('cloud_cover'))
+                cc10 = cc * 10 if cc <= 1 else cc
+                wind = int(max(0, round((10 - cc10) * 1.8)))  # rough km/h estimate
+            elif 'global_radiation' in r.index and not pd.isna(r.get('global_radiation')):
+                gr = float(r.get('global_radiation'))
+                # scale radiation to approx wind: more radiation -> slightly lower wind assumption
+                wind = int(max(0, round(10 - (gr / 100.0))))
+            else:
+                wind = 10
+        except Exception:
+            wind = 10
 
+    # pressure normalization
     pressure = None
     for pcol in ['pressure', 'sea_level', 'pressure_hpa']:
         if pcol in r.index and not pd.isna(r.get(pcol)):
@@ -226,11 +260,14 @@ def get_current_conditions(df: pd.DataFrame):
             else:
                 pressure = pval
         except Exception:
-            pass
+            pressure = None
 
+    # aqi
     aqi = None
-    if 'aqi' in r.index and not pd.isna(r.get('aqi')):
-        aqi = r.get('aqi')
+    for aq in ['aqi', 'air_quality_index']:
+        if aq in r.index and not pd.isna(r.get(aq)):
+            aqi = r.get(aq)
+            break
 
     city = r.get('city', 'Unknown') if 'city' in r.index else 'Unknown'
 
