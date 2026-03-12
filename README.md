@@ -3,6 +3,16 @@
 A **machine learning powered weather analysis and forecasting dashboard** built with **Python, Streamlit, and Scikit-learn**.
 The application allows users to explore weather datasets, visualize trends, train predictive models, and generate forecasts interactively.
 
+![alt text](image.png)
+
+![alt text](image-1.png)
+
+![alt text](image-2.png)
+
+![alt text](image-3.png)
+
+![alt text](image-4.png)
+
 ---
 
 ## 🚀 Features
