@@ -1,4 +1,9 @@
-# dashboard.py
+"""
+Streamlit dashboard for Synoptic Weather Forecast
+- tolerant to uploaded CSVs with mismatched column names
+- uses saved model metadata when available
+- safer prediction loop that uses pipeline.predict and fallback medians
+"""
 import streamlit as st
 from pathlib import Path
 import pandas as pd
@@ -9,9 +14,7 @@ import requests
 from datetime import datetime, timedelta
 import math
 
-# project imports (adjust if your package layout differs)
-from src.data_loader import load_csv, preprocess
-from src.train import train_random_forest_progress, train_sgd_progress
+from src.data_loader import load_csv, preprocess  # expects preprocess to set df.attrs if detection occurs
 from src.analysis import (
     summary_stats,
     plotly_time_series,
@@ -28,7 +31,15 @@ from src.models import (
     get_latest_by_base,
     load_model,
     extract_feature_importance,
+    load_model_meta_bin,
 )
+
+# try to import training helpers (optional)
+try:
+    from src.train import train_random_forest_progress, train_linear
+except Exception:
+    train_random_forest_progress = None
+    train_linear = None
 
 # ---- CONFIG ----
 st.set_page_config(page_title="Synoptic Weather Forecast", layout="wide", initial_sidebar_state="collapsed")
@@ -36,12 +47,12 @@ BASE = Path.cwd()
 MODELS_DIR = BASE / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
-# ---- THEME / CSS (kept same as before) ----
+# ---- THEME / CSS ----
 if "theme" not in st.session_state:
     st.session_state["theme"] = "dark"
 
+
 def inject_theme_css(theme: str):
-    """Inject CSS including animated weather icon helpers and heavier dark shadows."""
     if theme == "dark":
         page_bg = "#0b0d0f"
         text_color = "#eef2f6"
@@ -66,7 +77,6 @@ def inject_theme_css(theme: str):
     .forecast-cell {{ border-radius: 12px; padding: 12px; text-align:center; display:inline-block; min-width:140px; margin-right:12px; }}
     .stat-tile {{ display:flex; flex-direction:column; align-items:center; justify-content:center; padding:10px; border-radius:12px; min-width:110px; }}
     .cards-row {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    /* animation helpers (kept short) */
     .wx-icon {{ display:inline-block; vertical-align:middle; }}
     .sun-core {{ transform-origin:50% 50%; animation: sun-rotate 12s linear infinite; }}
     @keyframes sun-rotate {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
@@ -81,6 +91,7 @@ def inject_theme_css(theme: str):
     """
     st.markdown(css, unsafe_allow_html=True)
 
+
 inject_theme_css(st.session_state["theme"])
 
 # ---- helpers & model loader ----
@@ -88,19 +99,24 @@ inject_theme_css(st.session_state["theme"])
 def load_model_cached(path_str: str):
     return load_model(path_str)
 
+
 def refresh_model_list():
     return list_models()
 
+
 def safe_get(df, col, default=None):
     return df[col] if col in df.columns else default
+
 
 # session variables
 if "last_prediction" not in st.session_state:
     st.session_state["last_prediction"] = None
 if "use_forecast_main" not in st.session_state:
     st.session_state["use_forecast_main"] = False
+if "prefer_pretrained" not in st.session_state:
+    st.session_state["prefer_pretrained"] = True
 
-# get_animated_icon (same as previous helper) - keep or import from module
+# get_animated_icon (kept)
 def get_animated_icon(condition: str, size: int = 100):
     c = (condition or "").lower()
     if "rain" in c or "shower" in c or "drizzle" in c:
@@ -116,6 +132,7 @@ def get_animated_icon(condition: str, size: int = 100):
     svg = f"""<svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="sun-core"><circle cx="32" cy="32" r="12" fill="#FFD33D"/></g></svg>"""
     return svg
 
+
 # geo helpers
 def country_code_to_flag_emoji(code: str):
     if not code or len(code) != 2:
@@ -125,6 +142,7 @@ def country_code_to_flag_emoji(code: str):
         return "".join(chr(ord(c) + 127397) for c in code)
     except Exception:
         return ""
+
 
 def try_get_geolocation():
     apis = [("https://ipapi.co/json/", "ipapi"), ("https://ipinfo.io/json", "ipinfo")]
@@ -143,7 +161,8 @@ def try_get_geolocation():
             continue
     return None
 
-# load model & meta (attempt to load .meta or .meta.json)
+
+# load model & meta (attempt to load .meta or .meta.json; uses load_model_meta_bin if available)
 def load_model_and_meta():
     chosen_path = None
     if st.session_state.get("prefer_pretrained", True) and st.session_state.get("selected_model_file"):
@@ -164,16 +183,19 @@ def load_model_and_meta():
         st.error(f"Failed to load model: {e}")
         return None, None, None
 
-    # read metadata if exists
+    # read metadata: prefer binary meta loader if available
     meta = None
-    meta_json = chosen_path.with_suffix(chosen_path.suffix + ".meta.json")
-    meta_bin = chosen_path.with_suffix(chosen_path.suffix + ".meta")
     try:
-        if meta_json.exists():
-            with open(meta_json, "r") as fh:
-                meta = json.load(fh)
-        elif meta_bin.exists():
-            meta = joblib.load(meta_bin)
+        try:
+            meta = load_model_meta_bin(str(chosen_path))
+        except Exception:
+            meta_json = chosen_path.with_suffix(chosen_path.suffix + ".meta.json")
+            meta_bin = chosen_path.with_suffix(chosen_path.suffix + ".meta")
+            if meta_json.exists():
+                with open(meta_json, "r") as fh:
+                    meta = json.load(fh)
+            elif meta_bin.exists():
+                meta = joblib.load(meta_bin)
     except Exception:
         meta = None
 
@@ -184,18 +206,112 @@ def load_model_and_meta():
         model_features = list(model_features)
     return model, model_features, meta
 
-# clamp & validate prediction
-def sanitize_prediction(val, clip_min=-60.0, clip_max=60.0):
+
+# ---- prediction helpers & logic (with sanitization & scaler support) ----
+def _create_future_dates(last_date, n):
+    last_dt = pd.to_datetime(last_date, errors='coerce')
+    if pd.isna(last_dt):
+        last_dt = pd.Timestamp.now()
+    return [(last_dt + timedelta(days=i+1)).normalize() for i in range(n)]
+
+
+def sanitize_prediction(val, clip_min=-60.0, clip_max=60.0, max_abs=1e5):
     try:
         v = float(val)
-        # check for NaN/Inf and absurd magnitudes
-        if not math.isfinite(v) or abs(v) > 1e6:
+        if not math.isfinite(v) or abs(v) > max_abs:
             return None
-        # clip to realistic bounds
-        v = max(min(v, clip_max), clip_min)
-        return v
+        # final clip to user bounds
+        return max(min(v, clip_max), clip_min)
     except Exception:
         return None
+
+
+def _ensure_X_for_model_single(Xrow, model_features):
+    if model_features is None:
+        # try to use Xrow as-is but ensure numeric types where possible
+        try:
+            return Xrow.astype(float)
+        except Exception:
+            return Xrow.copy()
+    X2 = pd.DataFrame(index=[0])
+    for f in model_features:
+        if f in Xrow.columns:
+            X2[f] = Xrow[f].iloc[0]
+        else:
+            X2[f] = 0.0
+    return X2.astype(float)
+
+
+def _predict_future(df, features, n, model, model_features=None, meta=None, target_col_hint=None):
+    # get fallback median target
+    fallback = None
+    if meta is None:
+        meta = {}
+    if isinstance(meta, dict) and meta.get("target_median") is not None:
+        try:
+            fallback = float(meta.get("target_median"))
+        except Exception:
+            fallback = None
+    if fallback is None:
+        # compute from df using the target_col_hint if provided, else try common names
+        try:
+            if target_col_hint and target_col_hint in df.columns:
+                fallback = float(df[target_col_hint].median())
+            else:
+                # try mean_temp, temp etc.
+                for cand in ["mean_temp", "temp", "max_temp", "min_temp"]:
+                    if cand in df.columns:
+                        fallback = float(df[cand].median())
+                        break
+                if fallback is None:
+                    # last resort: median of all numeric columns' medians
+                    fallback = float(pd.Series([df[c].median() for c in df.select_dtypes(include=[np.number]).columns]).median())
+        except Exception:
+            fallback = 0.0
+
+    start_row = df[features].tail(1).copy().fillna(0)
+    future_dates = _create_future_dates(df['date'].iloc[-1], n)
+    rows = []
+    X_base = start_row.copy()
+
+    # prefer model.feature_names_in_ if present
+    model_feat_names = None
+    if hasattr(model, "feature_names_in_"):
+        model_feat_names = list(model.feature_names_in_)
+    elif model_features is not None:
+        model_feat_names = list(model_features)
+
+    for i in range(n):
+        Xp_df = _ensure_X_for_model_single(X_base, model_feat_names)
+        # predict straightforwardly: pipeline will scale if present
+        try:
+            raw_pred = model.predict(Xp_df)[0]
+        except Exception:
+            # as final fallback, use fallback median and continue
+            raw_pred = fallback
+
+        pred_val = sanitize_prediction(raw_pred)
+        if pred_val is None:
+            pred_val = float(fallback)
+
+        rec = {"date": future_dates[i], "pred_mean_temp": float(round(pred_val, 1))}
+        for col in ["precipitation", "wind", "pressure", "aqi", "humidity", "sunshine"]:
+            if col in df.columns:
+                rec[col] = df[col].iloc[-1]
+        rows.append(rec)
+
+        # update X_base with predicted temp for next iteration if relevant column exists
+        if 'mean_temp' in X_base.columns:
+            X_base.at[X_base.index[0], 'mean_temp'] = pred_val
+        else:
+            for tcol in ['temp', 'max_temp', 'min_temp']:
+                if tcol in X_base.columns:
+                    X_base.at[X_base.index[0], tcol] = pred_val
+                    break
+
+    df_pred = pd.DataFrame(rows)
+    return df_pred
+
 
 # ---- SIDEBAR ----
 with st.sidebar:
@@ -225,14 +341,38 @@ with st.sidebar:
     if df.empty:
         st.stop()
 
+    # preprocess: this should set df.attrs['detected_target_col'] when available
     df = preprocess(df)
 
+    # give the user some feedback about detected columns (helpful for uploads)
     with st.expander("Dataset overview", expanded=False):
+        st.write("Columns (normalized):", df.columns.tolist())
+        st.write("Detected date column:", df.attrs.get("detected_date_col", "date"))
+        st.write("Detected target column:", df.attrs.get("detected_target_col", None))
         st.dataframe(df.head(8))
         st.write(summary_stats(df.select_dtypes(include=[np.number])))
 
-    target = st.selectbox("Target variable", options=["mean_temp", "max_temp", "min_temp", "precipitation"], index=0)
-    default_features = [c for c in df.columns if c not in ["date", target]]
+    # --- smart target selection: use detection if available, otherwise present numeric columns ---
+    detected_target = df.attrs.get('detected_target_col')
+    target_candidates = [c for c in df.columns if c != 'date']
+
+    # prefer detected_target, else prefer mean_temp or first numeric candidate
+    if detected_target and detected_target in target_candidates:
+        default_index = target_candidates.index(detected_target)
+    else:
+        default_index = 0
+        if 'mean_temp' in target_candidates:
+            default_index = target_candidates.index('mean_temp')
+        else:
+            # try first numeric column if mean_temp not present
+            numeric_cols = [c for c in target_candidates if pd.api.types.is_numeric_dtype(df[c])]
+            if numeric_cols:
+                default_index = target_candidates.index(numeric_cols[0])
+
+    target = st.selectbox("Target variable", options=target_candidates, index=default_index)
+
+    # features: exclude date and target
+    default_features = [c for c in df.columns if c not in ['date', target]]
     features = st.multiselect("Features (choose at least 3)", options=default_features, default=default_features[:6])
 
     st.session_state["use_forecast_main"] = st.checkbox("Use model forecast for main card (when available)", value=st.session_state["use_forecast_main"])
@@ -240,16 +380,14 @@ with st.sidebar:
     with st.expander("Advanced / Training controls", expanded=False):
         n_estimators = st.number_input("RF: n_estimators", min_value=10, max_value=2000, value=100, step=10)
         rf_step = st.number_input("RF: progress step (trees per update)", min_value=1, max_value=200, value=10)
-        epochs = st.number_input("SGD: epochs", min_value=1, max_value=500, value=20)
 
-        model_choice = st.selectbox("Train model type", ["random_forest", "sgd"], index=0)
+        # prefer stable linear + RF
+        model_choice = st.selectbox("Train model type", ["random_forest", "linear"], index=0)
 
-        if "prefer_pretrained" not in st.session_state:
-            st.session_state["prefer_pretrained"] = True
         if "selected_model_file" not in st.session_state:
             latest_rf = get_latest_by_base("random_forest")
-            latest_sgd = get_latest_by_base("sgd")
-            default = latest_rf or latest_sgd
+            latest_lin = get_latest_by_base("linear")
+            default = latest_rf or latest_lin
             st.session_state["selected_model_file"] = default["filename"] if default else None
 
         model_entries = refresh_model_list()
@@ -271,109 +409,16 @@ with st.sidebar:
             st.session_state["prefer_pretrained"] = False
             st.success("Cleared pretrained selection — dashboard will use newly trained models by default.")
 
-        train_rf_btn = st.button("Train RF (with progress)")
-        train_sgd_btn = st.button("Train SGD (with progress)")
-        train_all = st.button("Train and save both (RF + SGD)")
+        train_rf_btn = st.button("Train RF (with progress)") if train_random_forest_progress else None
+        train_lin_btn = st.button("Train linear (closed-form)") if train_linear else None
+        train_all = st.button("Train and save both (RF + linear)")
 
     st.markdown("---")
     st.subheader("Prediction / Forecast")
     predict_n = st.number_input("Forecast next N days", min_value=1, max_value=365, value=5)
     predict_btn = st.button("Predict (forecast next N days)")
 
-# ---- prediction helpers & logic (with sanitization & scaler support) ----
-def _create_future_dates(last_date, n):
-    last_dt = pd.to_datetime(last_date, errors='coerce')
-    if pd.isna(last_dt):
-        last_dt = pd.Timestamp.now()
-    return [(last_dt + timedelta(days=i+1)).normalize() for i in range(n)]
-
-def _ensure_X_for_model(Xrow, model_features):
-    """Return a single-row DataFrame aligned to model_features, filling missing with last-known or zeros."""
-    if model_features is None:
-        return Xrow
-    X2 = pd.DataFrame(index=[0])
-    for f in model_features:
-        if f in Xrow.columns:
-            X2[f] = Xrow[f].iloc[0]
-        else:
-            X2[f] = 0.0
-    # cast to float
-    X2 = X2.astype(float)
-    return X2
-
-def _predict_future(df, features, n, model, model_features=None, meta=None):
-    start_row = df[features].tail(1).copy().fillna(0)
-    future_dates = _create_future_dates(df['date'].iloc[-1], n)
-    rows = []
-    X_base = start_row.copy()
-    scaler = None
-    if meta is not None:
-        # some metadata files include a saved scaler object under key 'scaler'
-        if isinstance(meta, dict) and meta.get("scaler") is not None:
-            scaler = meta.get("scaler")
-        # if meta is a joblib-loaded object that itself contains scaler
-        if hasattr(meta, "get") and meta.get("scaler", None) is not None:
-            scaler = meta.get("scaler")
-
-    for i in range(n):
-        Xp_df = _ensure_X_for_model(X_base, model_features)
-        # convert to numeric 2D array for model
-        try:
-            X_pred_input = Xp_df.astype(float).to_numpy().reshape(1, -1)
-        except Exception:
-            # fallback: try converting each column
-            Xp_df = Xp_df.apply(pd.to_numeric, errors='coerce').fillna(0.0)
-            X_pred_input = Xp_df.to_numpy().reshape(1, -1)
-
-        # apply scaler if available (best-effort)
-        try:
-            if scaler is not None:
-                # scaler might be a sklearn transformer
-                X_pred_input = scaler.transform(X_pred_input)
-        except Exception:
-            # ignore scaler errors but continue
-            pass
-
-        # predict
-        try:
-            raw_pred = model.predict(X_pred_input)[0]
-        except Exception as e:
-            st.error(f"Prediction failed during iterative forecast (model.predict error): {e}")
-            return None
-
-        # sanitize numeric value
-        pred_val = sanitize_prediction(raw_pred)
-        if pred_val is None:
-            # fallback: try cast and clip; if impossible, warn and set to 0.0
-            try:
-                pred_val = float(raw_pred)
-                if not math.isfinite(pred_val):
-                    pred_val = 0.0
-            except Exception:
-                pred_val = 0.0
-            # final clip
-            pred_val = max(min(pred_val, 60.0), -60.0)
-            st.warning(f"A raw prediction looked invalid ({raw_pred}); it was replaced with {pred_val:.1f}°C for stability.")
-
-        # store
-        rec = {"date": future_dates[i], "pred_mean_temp": float(round(pred_val, 1))}
-        for col in ["precipitation", "wind", "pressure", "aqi", "humidity", "sunshine"]:
-            if col in df.columns:
-                rec[col] = df[col].iloc[-1]
-        rows.append(rec)
-
-        # update X_base with predicted temp for next iteration if relevant column exists
-        if 'mean_temp' in X_base.columns:
-            X_base.at[X_base.index[0], 'mean_temp'] = pred_val
-        else:
-            for tcol in ['temp', 'max_temp', 'min_temp']:
-                if tcol in X_base.columns:
-                    X_base.at[X_base.index[0], tcol] = pred_val
-                    break
-
-    df_pred = pd.DataFrame(rows)
-    return df_pred
-
+# ---- prediction button logic ----
 if predict_btn:
     if not features or len(features) < 1:
         st.error("Please select at least one feature to enable prediction.")
@@ -382,7 +427,7 @@ if predict_btn:
         if model is None:
             st.error("No model available; check Advanced / Training controls.")
         else:
-            pred_df = _predict_future(df, features, int(predict_n), model, model_features=model_features, meta=meta)
+            pred_df = _predict_future(df, features, int(predict_n), model, model_features=model_features, meta=meta, target_col_hint=df.attrs.get('detected_target_col', None))
             if pred_df is not None:
                 st.session_state["last_prediction"] = pred_df
                 st.success(f"Forecast for next {len(pred_df)} days computed and stored in session.")
@@ -475,8 +520,9 @@ with right_col:
 
     st.markdown(f"<div class='big-card'>{big_temp_html}{stats_html}{precip_block}</div>", unsafe_allow_html=True)
 
-# ---- Forecast and hourly rendering (unchanged layout but sanitized preds used) ----
+# ---- Forecast and hourly rendering ----
 col_a, col_b = st.columns([1, 1.6])
+
 
 def _render_forecast_card(target_n=5):
     if st.session_state.get("last_prediction") is not None:
@@ -511,6 +557,7 @@ def _render_forecast_card(target_n=5):
             )
         cards_html += "</div>"
         st.markdown(cards_html, unsafe_allow_html=True)
+
 
 with col_a:
     _render_forecast_card(target_n=predict_n)
