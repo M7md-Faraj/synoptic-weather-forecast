@@ -1,25 +1,25 @@
+# analysis.py
 """
-Exploratory data analysis helpers.
-Return interactive Plotly figures for use in the dashboard.
+Analysis helpers for the dashboard.
 """
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
+from datetime import datetime
 
 def summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     return df.describe()
 
 def plotly_time_series(df: pd.DataFrame, col: str, title: str = None):
-    """
-    Interactive time series with rolling average overlay and simple animation-ready frame.
-    """
-    df = df.copy()
-    df = df.sort_values('date')
-    df['rolling_7'] = df[col].rolling(7, min_periods=1).mean()
+    dfc = df.copy()
+    if 'date' in dfc.columns:
+        dfc = dfc.sort_values('date')
+    dfc['rolling_7'] = dfc[col].rolling(7, min_periods=1).mean()
     title = title or f"Time series of {col}"
-    fig = px.line(df, x='date', y=col, title=title, labels={col: col, 'date': 'Date'})
-    fig.add_traces(px.line(df, x='date', y='rolling_7').data)
+    fig = px.line(dfc, x='date', y=col, title=title, labels={col: col, 'date': 'Date'})
+    fig.add_traces(px.line(dfc, x='date', y='rolling_7').data)
     fig.update_traces(mode='lines')
     fig.update_layout(hovermode='x unified', template='plotly_white')
     return fig
@@ -35,7 +35,7 @@ def correlation_heatmap_plotly(df: pd.DataFrame):
         zmid=0,
         colorbar=dict(title="corr")
     ))
-    fig.update_layout(title='Correlation heatmap', template='plotly_white', height=600)
+    fig.update_layout(title='Correlation heatmap', template='plotly_white', height=480)
     return fig
 
 def distribution_plot(df: pd.DataFrame, col: str):
@@ -44,17 +44,208 @@ def distribution_plot(df: pd.DataFrame, col: str):
     return fig
 
 def weather_condition_summary(df: pd.DataFrame, temp_col='mean_temp', precip_col='precipitation'):
-    """
-    Basic counts for hot/cold/rainy days. Thresholds can be adjusted.
-    Returns dict and a small bar figure.
-    """
-    df = df.copy()
-    hot = (df[temp_col] >= 25).sum()
-    warm = ((df[temp_col] >= 15) & (df[temp_col] < 25)).sum()
-    cool = ((df[temp_col] >= 5) & (df[temp_col] < 15)).sum()
-    cold = (df[temp_col] < 5).sum()
-    rainy = (df[precip_col] > 0).sum()
-    totals = {'hot': int(hot), 'warm': int(warm), 'cool': int(cool), 'cold': int(cold), 'rainy_days': int(rainy)}
+    dfc = df.copy()
+    if temp_col not in dfc.columns:
+        dfc[temp_col] = 0.0
+    if precip_col not in dfc.columns:
+        dfc[precip_col] = 0.0
+
+    hot = int((dfc[temp_col] >= 25).sum())
+    warm = int(((dfc[temp_col] >= 15) & (dfc[temp_col] < 25)).sum())
+    cool = int(((dfc[temp_col] >= 5) & (dfc[temp_col] < 15)).sum())
+    cold = int((dfc[temp_col] < 5).sum())
+    rainy = int((dfc[precip_col] > 0).sum())
+    totals = {'hot': hot, 'warm': warm, 'cool': cool, 'cold': cold, 'rainy_days': rainy}
+
     fig = px.bar(x=list(totals.keys()), y=list(totals.values()), labels={'x': 'condition', 'y': 'count'}, title='Weather condition counts')
-    fig.update_layout(template='plotly_white')
+    fig.update_layout(template='plotly_white', height=240)
     return totals, fig
+
+def _temp_icon(t):
+    if t >= 25:
+        return '☀️'
+    if t >= 15:
+        return '⛅️'
+    if t >= 5:
+        return '🌥️'
+    return '❄️'
+
+def build_5day_forecast(df: pd.DataFrame):
+    """Return list of 5 days from historical data (grouped by date)."""
+    out = []
+    if 'date' not in df.columns:
+        sample = df.tail(5)
+        for _, r in sample.iterrows():
+            try:
+                d = pd.to_datetime(r.get('date', pd.Timestamp.now())).strftime('%a')
+            except Exception:
+                d = 'Day'
+            out.append({'day': d, 'date': str(r.get('date','')), 'temp': int(round(r.get('mean_temp', r.get('max_temp', 0)))), 'icon': _temp_icon(r.get('mean_temp', 0))})
+        return out
+
+    df_sorted = df.copy()
+    # try common formats: ISO and also YYYYMMDD fallback
+    parsed = pd.to_datetime(df_sorted['date'], errors='coerce', infer_datetime_format=True)
+    if parsed.isna().all():
+        # try explicit YYYYMMDD format
+        try:
+            parsed = pd.to_datetime(df_sorted['date'], format='%Y%m%d', errors='coerce')
+        except Exception:
+            parsed = pd.to_datetime(df_sorted['date'], errors='coerce')
+    df_sorted['parsed_date'] = parsed
+    df_sorted = df_sorted.dropna(subset=['parsed_date'])
+    if df_sorted.empty:
+        return []
+    df_sorted['date_only'] = df_sorted['parsed_date'].dt.date
+    grouped = df_sorted.groupby('date_only').agg({'mean_temp':'mean'}).reset_index()
+    last5 = grouped.tail(5)
+    for _, r in last5.iterrows():
+        d = pd.to_datetime(r['date_only']).strftime('%a')
+        out.append({'day': d, 'date': str(r['date_only']), 'temp': int(round(r['mean_temp'])), 'icon': _temp_icon(r['mean_temp'])})
+    return out
+
+def build_hourly_preview(df: pd.DataFrame, n=5):
+    """Return a simple hourly preview from historical data (or fallback)."""
+    out = []
+    if 'time' in df.columns:
+        sample = df.sort_values('date').tail(n)
+        for _, r in sample.iterrows():
+            t = r.get('time') or pd.to_datetime(r['date']).strftime('%H:%M')
+            out.append({'time': t, 'temp': int(round(r.get('mean_temp', 0))), 'wind': int(round(r.get('wind', 0) if 'wind' in r.index else 0)), 'icon': _temp_icon(r.get('mean_temp',0))})
+        return out
+    sample = df.tail(n)
+    for _, r in sample.iterrows():
+        try:
+            t = pd.to_datetime(r.get('date')).strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            t = str(r.get('date'))
+        out.append({'time': t, 'temp': int(round(r.get('mean_temp', 0))), 'wind': int(round(r.get('wind', 0) if 'wind' in r.index else 0)), 'icon': _temp_icon(r.get('mean_temp',0))})
+    return out
+
+def get_current_conditions(df: pd.DataFrame):
+    """Gather a cleaned dictionary of current/historical conditions from the last row."""
+    if df is None or df.shape[0] == 0:
+        now = datetime.now()
+        return {
+            'time_str': now.strftime('%I:%M %p'),
+            'date_str': now.strftime('%A, %d %b %Y'),
+            'temp': 0.0,
+            'feels_like': 0.0,
+            'condition': 'Unknown',
+            'sunrise': '06:30',
+            'sunset': '18:30',
+            'humidity': 0,
+            'wind': 0,
+            'pressure': None,
+            'aqi': None,
+            'city': 'Unknown'
+        }
+
+    # robust parse for date column
+    df_sorted = df.copy()
+    try:
+        # try parsing directly with infer
+        parsed = pd.to_datetime(df_sorted['date'], errors='coerce', infer_datetime_format=True)
+        if parsed.isna().all():
+            # try explicit %Y%m%d if dataset like 19790101
+            parsed = pd.to_datetime(df_sorted['date'], format='%Y%m%d', errors='coerce')
+    except Exception:
+        parsed = pd.to_datetime(df_sorted['date'], errors='coerce')
+    df_sorted['parsed_date'] = parsed.fillna(pd.Timestamp.now())
+    r = df_sorted.sort_values('parsed_date').iloc[-1]
+
+    dt = r['parsed_date'] if not pd.isna(r['parsed_date']) else pd.Timestamp.now()
+    time_str = pd.to_datetime(dt).strftime('%I:%M %p')
+    date_str = pd.to_datetime(dt).strftime('%A, %d %b %Y')
+
+    temp = None
+    for tcol in ['mean_temp', 'temp', 'max_temp', 'min_temp']:
+        if tcol in r.index and not pd.isna(r.get(tcol)):
+            temp = r.get(tcol)
+            break
+    if temp is None:
+        temp = 0.0
+
+    feels_like = r.get('feels_like', temp)
+    if pd.isna(feels_like) or feels_like is None:
+        feels_like = temp
+
+    condition = None
+    for ccol in ['weather', 'condition', 'summary', 'cloud_cover']:
+        if ccol in r.index and not pd.isna(r.get(ccol)):
+            val = r.get(ccol)
+            if ccol == 'cloud_cover':
+                try:
+                    cc = float(val)
+                    if cc > 7:
+                        condition = 'Cloudy'
+                    elif cc > 3:
+                        condition = 'Partly cloudy'
+                    else:
+                        condition = 'Clear'
+                except Exception:
+                    condition = str(val)
+            else:
+                condition = str(val)
+            break
+    if condition is None:
+        condition = 'Unknown'
+
+    sunrise = r.get('sunrise', None)
+    sunset = r.get('sunset', None)
+    if sunrise is None or pd.isna(sunrise):
+        sunrise = '06:30'
+    if sunset is None or pd.isna(sunset):
+        sunset = '18:30'
+
+    humidity = None
+    for hcol in ['humidity', 'rel_humidity', 'rh', 'wet_bulb']:
+        if hcol in r.index and not pd.isna(r.get(hcol)):
+            humidity = r.get(hcol)
+            break
+    if humidity is None:
+        humidity = 0
+
+    wind = None
+    for wcol in ['wind', 'wind_speed', 'wind_kph', 'wind_km_h']:
+        if wcol in r.index and not pd.isna(r.get(wcol)):
+            wind = r.get(wcol)
+            break
+    if wind is None:
+        wind = 0
+
+    pressure = None
+    for pcol in ['pressure', 'sea_level', 'pressure_hpa']:
+        if pcol in r.index and not pd.isna(r.get(pcol)):
+            pressure = r.get(pcol)
+            break
+    if pressure is not None:
+        try:
+            pval = float(pressure)
+            if pval > 2000:
+                pressure = pval / 100.0
+            else:
+                pressure = pval
+        except Exception:
+            pass
+
+    aqi = None
+    if 'aqi' in r.index and not pd.isna(r.get('aqi')):
+        aqi = r.get('aqi')
+
+    city = r.get('city', 'Unknown') if 'city' in r.index else 'Unknown'
+
+    return {
+        'time_str': time_str,
+        'date_str': date_str,
+        'temp': float(temp) if temp is not None else 0.0,
+        'feels_like': float(feels_like) if feels_like is not None else float(temp),
+        'condition': condition,
+        'sunrise': sunrise,
+        'sunset': sunset,
+        'humidity': int(round(float(humidity))) if humidity is not None else 0,
+        'wind': int(round(float(wind))) if wind is not None else 0,
+        'pressure': pressure,
+        'aqi': int(aqi) if aqi is not None else None,
+        'city': city,
+    }
