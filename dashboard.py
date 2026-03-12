@@ -690,7 +690,6 @@ with col_b:
     st.markdown(hourly_html, unsafe_allow_html=True)
 
 # ---- Totals summary (only bottom) ----
-st.markdown("<hr />")
 st.markdown("### Totals summary")
 totals, _ = weather_condition_summary(df, temp_col='mean_temp', precip_col='precipitation')
 totals_df = pd.DataFrame(list(totals.items()), columns=['metric', 'value'])

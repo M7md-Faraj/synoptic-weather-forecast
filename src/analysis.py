@@ -1,4 +1,3 @@
-# analysis.py
 """
 Analysis helpers for the dashboard.
 """
