@@ -1,609 +1,271 @@
-"""
-Streamlit dashboard for Synoptic Weather Forecast
-- tolerant to uploaded CSVs with mismatched column names
-- uses saved model metadata when available
-- safer prediction loop that uses pipeline.predict and fallback medians
-"""
+# dashboard.py
 import streamlit as st
 from pathlib import Path
 import pandas as pd
 import numpy as np
-import joblib
-import json
-import requests
-from datetime import datetime, timedelta
-import math
-
-from src.data_loader import load_csv, preprocess  # expects preprocess to set df.attrs if detection occurs
+import io
+import calendar
+from src.data_loader import load_csv, preprocess
 from src.analysis import (
     summary_stats,
-    plotly_time_series,
+    missing_values_table,
+    plot_time_series,
+    monthly_aggregate_plot,
     correlation_heatmap_plotly,
     distribution_plot,
-    weather_condition_summary,
-    build_5day_forecast,
-    build_hourly_preview,
-    get_current_conditions,
+    predicted_vs_actual_plot
 )
-from src.models import (
-    save_model,
-    list_models,
-    get_latest_by_base,
-    load_model,
-    extract_feature_importance,
-    load_model_meta_bin,
-)
+from src.train import train_and_evaluate
+from src.models import get_model, save_model, list_models
+import plotly.express as px
+import json
+import joblib
 
-# try to import training helpers (optional)
-try:
-    from src.train import train_random_forest_progress, train_linear
-except Exception:
-    train_random_forest_progress = None
-    train_linear = None
+DATA_PATH = Path("data/weather.csv")
 
-# ---- CONFIG ----
-st.set_page_config(page_title="Synoptic Weather Forecast", layout="wide", initial_sidebar_state="collapsed")
-BASE = Path.cwd()
-MODELS_DIR = BASE / "models"
-MODELS_DIR.mkdir(exist_ok=True)
+st.set_page_config(page_title="Synoptic Weather Forecast - ML", layout="wide")
+st.title("Synoptic Weather Forecast — ML Forecasting")
 
-# ---- THEME / CSS ----
-if "theme" not in st.session_state:
-    st.session_state["theme"] = "dark"
+# ----- Animated emoji CSS  -----
+_EMOJI_CSS = """
+<style>
+.emoji-sunny {font-size:64px; display:inline-block; animation: sun-pulse 2.6s infinite; line-height:1;}
+@keyframes sun-pulse {0%{transform:scale(1);}50%{transform:scale(1.12);}100%{transform:scale(1);}}
+.emoji-rain {font-size:64px; display:inline-block; animation: rain-drop 1.2s infinite; line-height:1;}
+@keyframes rain-drop {0%{transform:translateY(-6px); opacity:0.75;}50%{transform:translateY(8px); opacity:1;}100%{transform:translateY(-6px); opacity:0.75;}}
+.icon-small {font-size:28px; vertical-align:middle;}
+.forecast-table {border-collapse:collapse; width:100%; margin-top:8px;}
+.forecast-table th, .forecast-table td {border:1px solid #ddd; padding:8px; text-align:center;}
+.forecast-table th {background:#f6f6f6; font-weight:700;}
+.forecast-date {text-align:left; padding-left:12px;}
+.forecast-temp {font-weight:700; text-align:right; padding-right:12px;}
+</style>
+"""
+st.markdown(_EMOJI_CSS, unsafe_allow_html=True)
 
+# ---- Load data ----
+@st.cache_data
+def _load_and_prep(path=DATA_PATH):
+    df = load_csv(path)
+    df = preprocess(df)
+    return df
 
-def inject_theme_css(theme: str):
-    if theme == "dark":
-        page_bg = "#0b0d0f"
-        text_color = "#eef2f6"
-        card_bg = "#1f2224"
-        shadow_strong = "0 30px 60px rgba(0,0,0,0.85), 0 8px 18px rgba(0,0,0,0.7)"
-    else:
-        page_bg = "#f3f6f9"
-        text_color = "#0b2545"
-        card_bg = "#ffffff"
-        shadow_strong = "0 18px 30px rgba(0,0,0,0.08), 0 6px 12px rgba(0,0,0,0.04)"
+if not DATA_PATH.exists():
+    st.error(f"Dataset not found at {DATA_PATH}. Please place your CSV at data/weather.csv")
+    st.stop()
 
-    css = f"""
-    <style>
-    .stApp {{ background: {page_bg} !important; color: {text_color} !important; }}
-    .css-18e3th9, .block-container, .stApp .main {{ background: {page_bg} !important; }}
-    .big-card {{ background: {card_bg} !important; color: {text_color} !important; border-radius: 18px !important; padding: 24px !important; box-shadow: {shadow_strong} !important; margin-bottom: 16px !important; }}
-    .small-card {{ background: {card_bg} !important; color: {text_color} !important; border-radius: 12px !important; padding: 12px !important; box-shadow: 0 12px 30px rgba(0,0,0,0.45) !important; margin-bottom: 12px !important; }}
-    .big-time {{ font-size: 72px; font-weight: 800; margin:8px 0; }}
-    .big-city {{ font-size: 26px; font-weight:700; }}
-    .big-temp {{ font-size: 110px; font-weight:900; line-height:0.9; }}
-    .deg {{ font-size: 36px; vertical-align: super; }}
-    .forecast-cell {{ border-radius: 12px; padding: 12px; text-align:center; display:inline-block; min-width:140px; margin-right:12px; }}
-    .stat-tile {{ display:flex; flex-direction:column; align-items:center; justify-content:center; padding:10px; border-radius:12px; min-width:110px; }}
-    .cards-row {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    .wx-icon {{ display:inline-block; vertical-align:middle; }}
-    .sun-core {{ transform-origin:50% 50%; animation: sun-rotate 12s linear infinite; }}
-    @keyframes sun-rotate {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
-    .ray {{ transform-origin: 50% 50%; animation: ray-pulse 2.8s ease-in-out infinite; }}
-    @keyframes ray-pulse {{ 0% {{ opacity: .85; transform: scale(1); }} 50% {{ opacity: .5; transform: scale(1.08); }} 100% {{ opacity: .85; transform: scale(1); }} }}
-    .cloud-move {{ animation: cloud-move 8s linear infinite; }} @keyframes cloud-move {{ 0% {{ transform: translateX(-5px); }} 50% {{ transform: translateX(5px); }} 100% {{ transform: translateX(-5px); }} }}
-    .rain-drop {{ animation: rain-fall 1.2s linear infinite; }} @keyframes rain-fall {{ 0% {{ transform: translateY(-8px); opacity: 0; }} 10% {{ opacity: 1; }} 100% {{ transform: translateY(18px); opacity: 0; }} }}
-    .snow-flake {{ animation: snow-fall 2.6s linear infinite; }} @keyframes snow-fall {{ 0% {{ transform: translateY(-6px) rotate(0deg); opacity: 0; }} 20% {{ opacity: 1; }} 100% {{ transform: translateY(26px) rotate(180deg); opacity: 0; }} }}
-    .bolt {{ animation: bolt-flash 1.8s linear infinite; opacity: 0; }} @keyframes bolt-flash {{ 0% {{ opacity: 0; }} 45% {{ opacity: 1; transform: translateY(0) scale(1); }} 50% {{ opacity: 1; transform: translateY(-2px) scale(1.03); }} 60% {{ opacity: 0; }} 100% {{ opacity: 0; }} }}
-    @media (max-width: 900px) {{ .big-temp {{ font-size: 72px; }} .big-time {{ font-size: 48px; }} }}
-    </style>
-    """
-    st.markdown(css, unsafe_allow_html=True)
+df = _load_and_prep(DATA_PATH)
 
+# Detect target default
+detected_target = df.attrs.get("detected_target_col", None) or "mean_temp"
+if detected_target not in df.columns:
+    numeric = df.select_dtypes(include=[np.number]).columns.tolist()
+    detected_target = numeric[0] if numeric else df.columns[0]
 
-inject_theme_css(st.session_state["theme"])
-
-# ---- helpers & model loader ----
-@st.cache_resource
-def load_model_cached(path_str: str):
-    return load_model(path_str)
-
-
-def refresh_model_list():
-    return list_models()
-
-
-def safe_get(df, col, default=None):
-    return df[col] if col in df.columns else default
-
-
-# session variables
-if "last_prediction" not in st.session_state:
-    st.session_state["last_prediction"] = None
-if "use_forecast_main" not in st.session_state:
-    st.session_state["use_forecast_main"] = False
-if "prefer_pretrained" not in st.session_state:
-    st.session_state["prefer_pretrained"] = True
-
-# get_animated_icon (kept)
-def get_animated_icon(condition: str, size: int = 100):
-    c = (condition or "").lower()
-    if "rain" in c or "shower" in c or "drizzle" in c:
-        svg = f"""<svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="cloud-move"><ellipse cx="30" cy="22" rx="18" ry="12" fill="#cfd8e3"/><ellipse cx="44" cy="24" rx="10" ry="8" fill="#dfe7f0"/></g><g transform="translate(16,34)" fill="#4DA6FF"><ellipse class="rain-drop" cx="6" cy="4" rx="2" ry="4" /><ellipse class="rain-drop" cx="16" cy="6" rx="2" ry="4" /><ellipse class="rain-drop" cx="26" cy="4" rx="2" ry="4" /></g></svg>"""
-        return svg
-    if "snow" in c or "sleet" in c:
-        svg = f"""<svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="cloud-move" fill="#dfe7f0"><ellipse cx="30" cy="22" rx="18" ry="12"/><ellipse cx="44" cy="24" rx="10" ry="8"/></g><g transform="translate(16,36)" fill="#ffffff"><text class="snow-flake" x="6" y="6" font-size="10">❄</text><text class="snow-flake" x="18" y="8" font-size="10">❄</text><text class="snow-flake" x="30" y="6" font-size="10">❄</text></g></svg>"""
-        return svg
-    if "cloud" in c or "overcast" in c:
-        svg = f"""<svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="cloud-move" fill="#d0d6df"><ellipse cx="26" cy="26" rx="18" ry="12"/><ellipse cx="42" cy="28" rx="12" ry="9"/></g></svg>"""
-        return svg
-    # partly / sunny fallback
-    svg = f"""<svg class="wx-icon" width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="sun-core"><circle cx="32" cy="32" r="12" fill="#FFD33D"/></g></svg>"""
-    return svg
-
-
-# geo helpers
-def country_code_to_flag_emoji(code: str):
-    if not code or len(code) != 2:
-        return ""
-    try:
-        code = code.upper()
-        return "".join(chr(ord(c) + 127397) for c in code)
-    except Exception:
-        return ""
-
-
-def try_get_geolocation():
-    apis = [("https://ipapi.co/json/", "ipapi"), ("https://ipinfo.io/json", "ipinfo")]
-    for url, tag in apis:
-        try:
-            resp = requests.get(url, timeout=3)
-            if resp.status_code != 200:
-                continue
-            js = resp.json()
-            city = js.get("city")
-            region = js.get("region")
-            country_name = js.get("country_name") or js.get("country")
-            country_code = js.get("country") or js.get("countryCode") or js.get("country_code")
-            return {"city": city, "region": region, "country": country_name, "country_code": (country_code or "").upper()}
-        except Exception:
-            continue
-    return None
-
-
-# load model & meta (attempt to load .meta or .meta.json; uses load_model_meta_bin if available)
-def load_model_and_meta():
-    chosen_path = None
-    if st.session_state.get("prefer_pretrained", True) and st.session_state.get("selected_model_file"):
-        chosen_filename = st.session_state["selected_model_file"]
-        chosen_path = MODELS_DIR / chosen_filename
-    else:
-        try:
-            latest = get_latest_by_base(model_choice)
-            chosen_path = Path(latest["path"]) if latest else None
-        except Exception:
-            chosen_path = None
-
-    if not chosen_path or not chosen_path.exists():
-        return None, None, None
-    try:
-        model = load_model_cached(str(chosen_path))
-    except Exception as e:
-        st.error(f"Failed to load model: {e}")
-        return None, None, None
-
-    # read metadata: prefer binary meta loader if available
-    meta = None
-    try:
-        try:
-            meta = load_model_meta_bin(str(chosen_path))
-        except Exception:
-            meta_json = chosen_path.with_suffix(chosen_path.suffix + ".meta.json")
-            meta_bin = chosen_path.with_suffix(chosen_path.suffix + ".meta")
-            if meta_json.exists():
-                with open(meta_json, "r") as fh:
-                    meta = json.load(fh)
-            elif meta_bin.exists():
-                meta = joblib.load(meta_bin)
-    except Exception:
-        meta = None
-
-    model_features = getattr(model, "feature_names_in_", None)
-    if model_features is None and meta is not None:
-        model_features = meta.get("features") or meta.get("feature_names")
-    if model_features is not None:
-        model_features = list(model_features)
-    return model, model_features, meta
-
-
-# ---- prediction helpers & logic (with sanitization & scaler support) ----
-def _create_future_dates(last_date, n):
-    last_dt = pd.to_datetime(last_date, errors='coerce')
-    if pd.isna(last_dt):
-        last_dt = pd.Timestamp.now()
-    return [(last_dt + timedelta(days=i+1)).normalize() for i in range(n)]
-
-
-def sanitize_prediction(val, clip_min=-60.0, clip_max=60.0, max_abs=1e5):
-    try:
-        v = float(val)
-        if not math.isfinite(v) or abs(v) > max_abs:
-            return None
-        # final clip to user bounds
-        return max(min(v, clip_max), clip_min)
-    except Exception:
-        return None
-
-
-def _ensure_X_for_model_single(Xrow, model_features):
-    if model_features is None:
-        # try to use Xrow as-is but ensure numeric types where possible
-        try:
-            return Xrow.astype(float)
-        except Exception:
-            return Xrow.copy()
-    X2 = pd.DataFrame(index=[0])
-    for f in model_features:
-        if f in Xrow.columns:
-            X2[f] = Xrow[f].iloc[0]
-        else:
-            X2[f] = 0.0
-    return X2.astype(float)
-
-
-def _predict_future(df, features, n, model, model_features=None, meta=None, target_col_hint=None):
-    # get fallback median target
-    fallback = None
-    if meta is None:
-        meta = {}
-    if isinstance(meta, dict) and meta.get("target_median") is not None:
-        try:
-            fallback = float(meta.get("target_median"))
-        except Exception:
-            fallback = None
-    if fallback is None:
-        # compute from df using the target_col_hint if provided, else try common names
-        try:
-            if target_col_hint and target_col_hint in df.columns:
-                fallback = float(df[target_col_hint].median())
-            else:
-                # try mean_temp, temp etc.
-                for cand in ["mean_temp", "temp", "max_temp", "min_temp"]:
-                    if cand in df.columns:
-                        fallback = float(df[cand].median())
-                        break
-                if fallback is None:
-                    # last resort: median of all numeric columns' medians
-                    fallback = float(pd.Series([df[c].median() for c in df.select_dtypes(include=[np.number]).columns]).median())
-        except Exception:
-            fallback = 0.0
-
-    start_row = df[features].tail(1).copy().fillna(0)
-    future_dates = _create_future_dates(df['date'].iloc[-1], n)
-    rows = []
-    X_base = start_row.copy()
-
-    # prefer model.feature_names_in_ if present
-    model_feat_names = None
-    if hasattr(model, "feature_names_in_"):
-        model_feat_names = list(model.feature_names_in_)
-    elif model_features is not None:
-        model_feat_names = list(model_features)
-
-    for i in range(n):
-        Xp_df = _ensure_X_for_model_single(X_base, model_feat_names)
-        # predict straightforwardly: pipeline will scale if present
-        try:
-            raw_pred = model.predict(Xp_df)[0]
-        except Exception:
-            # as final fallback, use fallback median and continue
-            raw_pred = fallback
-
-        pred_val = sanitize_prediction(raw_pred)
-        if pred_val is None:
-            pred_val = float(fallback)
-
-        rec = {"date": future_dates[i], "pred_mean_temp": float(round(pred_val, 1))}
-        for col in ["precipitation", "wind", "pressure", "aqi", "humidity", "sunshine"]:
-            if col in df.columns:
-                rec[col] = df[col].iloc[-1]
-        rows.append(rec)
-
-        # update X_base with predicted temp for next iteration if relevant column exists
-        if 'mean_temp' in X_base.columns:
-            X_base.at[X_base.index[0], 'mean_temp'] = pred_val
-        else:
-            for tcol in ['temp', 'max_temp', 'min_temp']:
-                if tcol in X_base.columns:
-                    X_base.at[X_base.index[0], tcol] = pred_val
-                    break
-
-    df_pred = pd.DataFrame(rows)
-    return df_pred
-
-
-# ---- SIDEBAR ----
+# Sidebar: settings
 with st.sidebar:
-    st.markdown("# Controls")
-    checked = st.checkbox("Dark", value=(st.session_state["theme"] == "dark"))
-    new_theme = "dark" if checked else "light"
-    if new_theme != st.session_state["theme"]:
-        st.session_state["theme"] = new_theme
-        inject_theme_css(new_theme)
+    st.header("Settings")
+    st.markdown("Choose project defaults and model options.")
+    target = st.selectbox("Target variable", options=[c for c in df.columns if c != 'date'], index=max(0, list(df.columns).index(detected_target)) )
+    test_size = st.slider("Test set fraction (chronological)", min_value=0.05, max_value=0.5, value=0.2, step=0.05)
+    rf_n = st.number_input("Random Forest trees", min_value=10, max_value=1000, value=100, step=10)
+    rf_max_depth = st.number_input("RF max depth (0 = None)", min_value=0, max_value=50, value=0, step=1)
+    if rf_max_depth == 0:
+        rf_max_depth = None
+    do_train = st.button("Train & Evaluate Models")
 
-    st.markdown("---")
-    uploaded = st.file_uploader("Upload CSV (optional)", type=["csv"])
-    if uploaded:
-        try:
-            df = pd.read_csv(uploaded)
-        except Exception as e:
-            st.error(f"Failed to read uploaded CSV: {e}")
-            df = pd.DataFrame()
+# Page selector
+page = st.sidebar.radio("Pages", ["Home", "EDA", "Models & Evaluation", "Forecast"])
+
+# --- HOME ---
+if page == "Home":
+    st.subheader("Project aim")
+    st.write("A compact machine-learning forecasting pipeline for daily mean temperature. This app demonstrates preprocessing, EDA, model comparison (Linear Regression, Decision Tree, Random Forest), evaluation, and a simple forecast interface.")
+    # Dataset summary
+    st.markdown("### Dataset summary")
+    rows = len(df)
+    date_min = pd.to_datetime(df['date'], errors='coerce').min()
+    date_max = pd.to_datetime(df['date'], errors='coerce').max()
+    st.write(f"- Rows: **{rows}**")
+    st.write(f"- Date range: **{date_min.date() if pd.notna(date_min) else 'unknown'}** → **{date_max.date() if pd.notna(date_max) else 'unknown'}**")
+    st.write(f"- Target variable: **{target}**")
+    st.write("- Models: **Linear Regression**, **Decision Tree**, **Random Forest**")
+    st.write("- Evaluation metrics: **MAE**, **RMSE**, **MAPE**, **R²**")
+
+    st.markdown("### Visuals")
+    # Three visuals: time series, monthly mean, monthly boxplot
+    col1, col2 = st.columns(2)
+    with col1:
+        st.plotly_chart(plot_time_series(df, date_col='date', target=target), use_container_width=True)
+    with col2:
+        st.plotly_chart(monthly_aggregate_plot(df, date_col='date', target=target, agg='mean'), use_container_width=True)
+
+    st.markdown("#### Monthly distribution (boxplot)")
+    # monthly boxplot (added)
+    df_bp = df.copy()
+    try:
+        df_bp['month_num'] = pd.to_datetime(df_bp['date']).dt.month
+        df_bp['month_name'] = df_bp['month_num'].apply(lambda m: calendar.month_abbr[m] if m and m>0 else "")
+        # keep month order
+        month_order = list(calendar.month_abbr)[1:]
+        fig_bp = px.box(df_bp, x='month_name', y=target, category_orders={'month_name': month_order}, title=f'Monthly distribution of {target}')
+        fig_bp.update_layout(template='plotly_white', height=420)
+        st.plotly_chart(fig_bp, use_container_width=True)
+    except Exception:
+        st.info("Monthly boxplot not available (check date parsing).")
+
+    st.markdown("### One short limitation")
+    st.info("This model uses only historical, tabular features from the dataset and a simple chronological train/test split. It does not account for exogenous weather model outputs or climate regime shifts — results should be interpreted as a demonstration, not operational forecasts.")
+
+# --- EDA ---
+elif page == "EDA":
+    st.header("Exploratory Data Analysis")
+    st.subheader("Summary statistics (numeric columns)")
+    st.dataframe(summary_stats(df.select_dtypes(include=[np.number])))
+
+    st.subheader("Missing values")
+    mv = missing_values_table(df)
+    st.dataframe(mv)
+
+    st.subheader("Correlation heatmap")
+    st.plotly_chart(correlation_heatmap_plotly(df), use_container_width=True)
+
+    st.subheader("Distribution of target")
+    st.plotly_chart(distribution_plot(df, target), use_container_width=True)
+
+    st.subheader("Top 5 rows")
+    st.dataframe(df.head(5))
+
+    st.markdown("**Short findings (example)**")
+    st.write("- Check correlations for predictors strongly associated with the target (e.g. mean_temp with max_temp/min_temp).")
+    st.write("- Missing values are forward/backfilled in preprocessing; verify extreme imputation and data quality before operational use.")
+    st.write("- Use monthly aggregation to inspect seasonality patterns.")
+
+# --- Models & Evaluation ---
+elif page == "Models & Evaluation":
+    st.header("Models & Evaluation")
+    st.markdown("Train/test strategy: chronological split (first `1-test_size` fraction used for training, last `test_size` fraction for testing). This prevents data leakage from future into past.")
+
+    if do_train:
+        with st.spinner("Training models..."):
+            results = train_and_evaluate(df, features=[c for c in df.columns if c not in ['date', target]], target=target, test_size=test_size, rf_n=rf_n, rf_max_depth=rf_max_depth)
+            st.session_state['train_results'] = results
+            st.success("Training complete — results stored in session.")
     else:
-        st.info("Using CSV from data/weather.csv")
-        try:
-            df = load_csv("data/weather.csv")
-        except Exception as e:
-            st.error(f"Failed to load local CSV: {e}")
-            df = pd.DataFrame()
+        results = st.session_state.get('train_results', None)
 
-    if df.empty:
+    if results is None:
+        st.info("Train models on the sidebar (Train & Evaluate Models).")
         st.stop()
 
-    # preprocess: this should set df.attrs['detected_target_col'] when available
-    df = preprocess(df)
+    # Collect metrics into a table
+    table = []
+    for name in ['linear', 'decision_tree', 'random_forest']:
+        m = results[name]['metrics']
+        table.append({"model": name, "mae": round(m['mae'],3), "rmse": round(m['rmse'],3), "mape": round(m['mape'],3), "r2": round(m['r2'],3)})
+    metrics_df = pd.DataFrame(table).set_index('model')
+    st.subheader("Metrics (test set)")
+    st.dataframe(metrics_df)
 
-    # give the user some feedback about detected columns (helpful for uploads)
-    with st.expander("Dataset overview", expanded=False):
-        st.write("Columns (normalized):", df.columns.tolist())
-        st.write("Detected date column:", df.attrs.get("detected_date_col", "date"))
-        st.write("Detected target column:", df.attrs.get("detected_target_col", None))
-        st.dataframe(df.head(8))
-        st.write(summary_stats(df.select_dtypes(include=[np.number])))
+    # Bar chart for comparison
+    st.plotly_chart(px.bar(metrics_df.reset_index().melt(id_vars='model', var_name='metric', value_name='value'), x='metric', y='value', color='model', barmode='group', title='Model comparison'), use_container_width=True)
 
-    # --- smart target selection: use detection if available, otherwise present numeric columns ---
-    detected_target = df.attrs.get('detected_target_col')
-    target_candidates = [c for c in df.columns if c != 'date']
+    # Best model selection (by RMSE)
+    best = min(table, key=lambda r: r['rmse'])
+    best_name = best['model']
+    st.success(f"Best model by RMSE: **{best_name}**")
 
-    # prefer detected_target, else prefer mean_temp or first numeric candidate
-    if detected_target and detected_target in target_candidates:
-        default_index = target_candidates.index(detected_target)
-    else:
-        default_index = 0
-        if 'mean_temp' in target_candidates:
-            default_index = target_candidates.index('mean_temp')
-        else:
-            # try first numeric column if mean_temp not present
-            numeric_cols = [c for c in target_candidates if pd.api.types.is_numeric_dtype(df[c])]
-            if numeric_cols:
-                default_index = target_candidates.index(numeric_cols[0])
+    # Predicted vs Actual for best model
+    y_test = results['y_test']
+    y_pred = results[best_name]['pred']
+    dates_test = results['test_df']['date'].tolist()
+    st.subheader("Predicted vs Actual (best model)")
+    st.plotly_chart(predicted_vs_actual_plot(y_test, y_pred, dates=dates_test), use_container_width=True)
 
-    target = st.selectbox("Target variable", options=target_candidates, index=default_index)
-
-    # features: exclude date and target
-    default_features = [c for c in df.columns if c not in ['date', target]]
-    features = st.multiselect("Features (choose at least 3)", options=default_features, default=default_features[:6])
-
-    st.session_state["use_forecast_main"] = st.checkbox("Use model forecast for main card (when available)", value=st.session_state["use_forecast_main"])
-
-    with st.expander("Advanced / Training controls", expanded=False):
-        n_estimators = st.number_input("RF: n_estimators", min_value=10, max_value=2000, value=100, step=10)
-        rf_step = st.number_input("RF: progress step (trees per update)", min_value=1, max_value=200, value=10)
-
-        # prefer stable linear + RF
-        model_choice = st.selectbox("Train model type", ["random_forest", "linear"], index=0)
-
-        if "selected_model_file" not in st.session_state:
-            latest_rf = get_latest_by_base("random_forest")
-            latest_lin = get_latest_by_base("linear")
-            default = latest_rf or latest_lin
-            st.session_state["selected_model_file"] = default["filename"] if default else None
-
-        model_entries = refresh_model_list()
-        model_options = [m["filename"] for m in model_entries]
-        if model_options:
-            opts = ["(none)"] + model_options
-            chosen_index = 0
-            if st.session_state["selected_model_file"] in model_options:
-                chosen_index = model_options.index(st.session_state["selected_model_file"]) + 1
-            sel = st.selectbox("Choose pretrained model", options=opts, index=chosen_index)
-            st.session_state["selected_model_file"] = None if sel == "(none)" else sel
-        else:
-            st.info("No pretrained models found in /models.")
-
-        st.session_state["prefer_pretrained"] = st.checkbox("Prefer pretrained model", value=st.session_state["prefer_pretrained"])
-
-        if st.button("Clear pretrained selection"):
-            st.session_state["selected_model_file"] = None
-            st.session_state["prefer_pretrained"] = False
-            st.success("Cleared pretrained selection — dashboard will use newly trained models by default.")
-
-        train_rf_btn = st.button("Train RF (with progress)") if train_random_forest_progress else None
-        train_lin_btn = st.button("Train linear (closed-form)") if train_linear else None
-        train_all = st.button("Train and save both (RF + linear)")
-
-    st.markdown("---")
-    st.subheader("Prediction / Forecast")
-    predict_n = st.number_input("Forecast next N days", min_value=1, max_value=365, value=5)
-    predict_btn = st.button("Predict (forecast next N days)")
-
-# ---- prediction button logic ----
-if predict_btn:
-    if not features or len(features) < 1:
-        st.error("Please select at least one feature to enable prediction.")
-    else:
-        model, model_features, meta = load_model_and_meta()
-        if model is None:
-            st.error("No model available; check Advanced / Training controls.")
-        else:
-            pred_df = _predict_future(df, features, int(predict_n), model, model_features=model_features, meta=meta, target_col_hint=df.attrs.get('detected_target_col', None))
-            if pred_df is not None:
-                st.session_state["last_prediction"] = pred_df
-                st.success(f"Forecast for next {len(pred_df)} days computed and stored in session.")
-
-# ---- MAIN VIEW ----
-geo = try_get_geolocation()
-current_display = get_current_conditions(df)
-
-# choose location label
-city_label = None
-flag = ""
-if geo and geo.get("city"):
-    code = geo.get("country_code") or ""
-    flag = country_code_to_flag_emoji(code)
-    city_label = f"{geo.get('city')}, {geo.get('country') or geo.get('region')}"
-elif current_display.get("city") and current_display.get("city") != "Unknown":
-    city_label = current_display.get("city")
-else:
-    city_label = "Arizona, USA"
-    flag = country_code_to_flag_emoji("US")
-
-left_col, right_col = st.columns([2.2, 1.6])
-
-with left_col:
-    now = datetime.now()
-    time_str = now.strftime("%I:%M %p")
-    city_html = f"<div class='big-city'>{flag} {city_label}</div>"
-    time_html = f"<div class='big-time'>{time_str}</div>"
-    date_html = f"<div style='font-size:16px; color:var(--text-color)'>{now.strftime('%A, %d %b %Y')}</div>"
-    st.markdown(f"<div class='big-card'>{city_html}{time_html}{date_html}</div>", unsafe_allow_html=True)
-
-# main right card - use forecast override if chosen
-if st.session_state["use_forecast_main"] and st.session_state["last_prediction"] is not None:
-    p0 = st.session_state["last_prediction"].iloc[0]
-    temp_val = float(p0.get("pred_mean_temp", current_display.get("temp", 0.0)))
-    feels = temp_val
-    condition = current_display.get("condition", "Forecast")
-    humidity = int(p0.get("humidity", current_display.get("humidity") or 0))
-    wind = int(p0.get("wind", current_display.get("wind") or 0))
-    pressure_val = p0.get("pressure", current_display.get("pressure"))
-    precip_val = p0.get("precipitation", current_display.get("precipitation"))
-    aqi_val = p0.get("aqi", current_display.get("aqi"))
-else:
-    temp_val = current_display.get("temp", 0.0)
-    feels = current_display.get("feels_like", temp_val)
-    condition = current_display.get("condition", "Unknown")
-    humidity = current_display.get("humidity", 0)
-    wind = current_display.get("wind", 0)
-    pressure_val = current_display.get("pressure", None)
-    precip_val = current_display.get("precipitation", None)
-    aqi_val = current_display.get("aqi", None)
-
-# normalize pressure -> hPa
-pressure_str = "—"
-if pressure_val is not None:
+    # Feature importance for Random Forest
+    st.subheader("Feature importance (Random Forest)")
+    rf_model = results['random_forest']['model']
+    features_list = [c for c in df.columns if c not in ['date', target]]
     try:
-        ptemp = float(pressure_val)
-        if ptemp > 2000:
-            ptemp = ptemp / 100.0
-        pressure_str = f"{int(round(ptemp))} hPa"
-    except Exception:
-        pressure_str = str(pressure_val)
+        importances = rf_model.feature_importances_
+        imp_df = pd.DataFrame({"feature": features_list, "importance": importances}).sort_values("importance", ascending=False).head(20)
+        st.dataframe(imp_df.set_index('feature'))
+        st.plotly_chart(px.bar(imp_df, x='feature', y='importance', title='RF feature importance'), use_container_width=True)
+    except Exception as e:
+        st.write("Feature importance not available:", e)
 
-aqi_str = str(int(aqi_val)) if (aqi_val is not None and not pd.isna(aqi_val)) else "—"
-precip_str = f"{precip_val} mm" if (precip_val is not None and not pd.isna(precip_val)) else "—"
+    # Option to save best model
+    if st.button("Save best model"):
+        model_obj = results[best_name]['model']
+        path, meta = save_model(model_obj, base_name=best_name, features=features_list, metrics=results[best_name]['metrics'])
+        st.success(f"Saved model to {path}")
 
-big_icon_html = get_animated_icon(condition, size=120)
+# --- Forecast ---
+elif page == "Forecast":
+    st.header("Forecast")
+    st.write("Use the best model saved in session (from Models page) to produce short horizon forecasts. Forecast uses last available row's features and iteratively predicts next days.")
 
-with right_col:
-    big_temp_html = (
-        f"<div style='display:flex; align-items:center; justify-content:space-between'>"
-        f"<div><div class='big-temp'>{int(round(temp_val))}<span class='deg'>°C</span></div>"
-        f"<div style='font-size:18px; font-weight:700; margin-top:6px'>Feels like: {int(round(feels))}°C</div></div>"
-        f"<div style='text-align:center; min-width:140px'>{big_icon_html}<div style='margin-top:8px; font-weight:700'>{condition}</div></div></div>"
-    )
+    results = st.session_state.get('train_results', None)
+    if results is None:
+        st.info("Train models first on the Models & Evaluation page.")
+        st.stop()
 
-    uv_val = df['uv'].iloc[-1] if 'uv' in df.columns and not pd.isna(df['uv'].iloc[-1]) else None
-    uv_str = str(int(uv_val)) if uv_val is not None else "—"
+    best = min([{"model":k, **{"rmse": results[k]["metrics"]["rmse"]}} for k in ['linear','decision_tree','random_forest']], key=lambda x: x['rmse'])
+    best_name = best['model']
+    st.write(f"Using best model: **{best_name}**")
+    model_obj = results[best_name]['model']
+    features_list = [c for c in df.columns if c not in ['date', target]]
 
-    stats_html = (
-        "<div style='display:flex; gap:12px; margin-top:16px; flex-wrap:wrap'>"
-        f"<div class='stat-tile' style='background:var(--card-bg)'><div style='font-size:20px'>💧</div><div style='font-weight:800; font-size:18px'>{int(humidity)}%</div><div style='font-size:12px'>Humidity</div></div>"
-        f"<div class='stat-tile' style='background:var(--card-bg)'><div style='font-size:20px'>💨</div><div style='font-weight:800; font-size:18px'>{int(wind)} km/h</div><div style='font-size:12px'>Wind</div></div>"
-        f"<div class='stat-tile' style='background:var(--card-bg)'><div style='font-size:20px'>⎈</div><div style='font-weight:800; font-size:18px'>{pressure_str}</div><div style='font-size:12px'>Pressure</div></div>"
-        f"<div class='stat-tile' style='background:var(--card-bg)'><div style='font-size:20px'>☀️</div><div style='font-weight:800; font-size:18px'>{uv_str}</div><div style='font-size:12px'>UV</div></div>"
-        "</div>"
-    )
+    n_days = st.number_input("Forecast horizon (days)", min_value=1, max_value=30, value=5)
+    # user option: show big emoji or plain numeric table
+    use_emoji = st.checkbox("Show big animated emoji (sun / rain) in forecast table", value=True)
 
-    precip_block = f"<div style='margin-top:12px; color:var(--text-color)'>🌧️ Precipitation: <strong>{precip_str}</strong> · 🩺 AQI: <strong>{aqi_str}</strong></div>"
-
-    st.markdown(f"<div class='big-card'>{big_temp_html}{stats_html}{precip_block}</div>", unsafe_allow_html=True)
-
-# ---- Forecast and hourly rendering ----
-col_a, col_b = st.columns([1, 1.6])
-
-
-def _render_forecast_card(target_n=5):
-    if st.session_state.get("last_prediction") is not None:
-        pred_df = st.session_state["last_prediction"].copy()
-        to_show = pred_df.head(int(target_n))
-        cards_html = f"<div class='small-card'><h3>{target_n}-Day Forecast</h3>"
-        for _, r in to_show.iterrows():
-            dt_s = pd.to_datetime(r['date']).strftime('%a<br>%Y-%m-%d')
-            temp = int(round(r.get('pred_mean_temp', 0)))
-            cond = r.get('condition', '')
-            icon_html = get_animated_icon(cond or ('sunny' if temp >= 15 else 'snow'), size=28)
-            precip = r.get('precipitation', '—')
-            wind = r.get('wind', '—')
-            cards_html += (
-                f"<div style='display:flex; align-items:center; justify-content:space-between; padding:8px 6px'>"
-                f"<div style='display:flex; gap:12px; align-items:center'><div style='font-size:22px'>{icon_html}</div>"
-                f"<div><div style='font-weight:700'>{dt_s}</div><div style='font-size:12px'>Precip: {precip} mm · Wind: {wind} km/h</div></div></div>"
-                f"<div style='text-align:right'><div style='font-weight:700'>{temp}°C</div></div></div>"
-            )
-        cards_html += "</div>"
-        st.markdown(cards_html, unsafe_allow_html=True)
-    else:
-        five = build_5day_forecast(df)
-        cards_html = "<div class='small-card'><h3>5 Days Forecast (historical)</h3>"
-        for day in five:
-            icon_html = get_animated_icon(day.get('icon', ''), size=28)
-            cards_html += (
-                f"<div style='display:flex; align-items:center; justify-content:space-between; padding:8px 6px'>"
-                f"<div style='display:flex; gap:12px; align-items:center'><div style='font-size:22px'>{icon_html}</div>"
-                f"<div><div style='font-weight:700'>{day['day']}</div><div style='font-size:12px'>{day['date']}</div></div></div>"
-                f"<div style='text-align:right'><div style='font-weight:700'>{day['temp']}°C</div></div></div>"
-            )
-        cards_html += "</div>"
-        st.markdown(cards_html, unsafe_allow_html=True)
-
-
-with col_a:
-    _render_forecast_card(target_n=predict_n)
-
-with col_b:
-    hourly_html = f"<div class='small-card'><h3>Hourly Forecast</h3><div style='display:flex; gap:12px; overflow:auto; padding-top:8px'>"
-    hourly = []
-    if st.session_state.get("last_prediction") is not None:
-        pred_df = st.session_state["last_prediction"].head(8)
-        for _, r in pred_df.iterrows():
-            t = pd.to_datetime(r['date']).strftime('%Y-%m-%d 00:00')
-            hourly.append({'time': t, 'temp': int(round(r.get('pred_mean_temp', 0))), 'wind': r.get('wind', 0), 'cond': r.get('condition', ''), 'precip': r.get('precipitation', 0)})
-    else:
-        hist = df.tail(8)
-        for _, r in hist.iterrows():
+    if st.button("Generate forecast"):
+        last_row = df[features_list].tail(1).copy().fillna(0)
+        out_rows = []
+        last_date = pd.to_datetime(df['date'].iloc[-1], errors='coerce')
+        if pd.isna(last_date):
+            last_date = pd.Timestamp.now()
+        for i in range(n_days):
+            Xp = last_row.copy()
             try:
-                t = pd.to_datetime(r.get('date')).strftime('%Y-%m-%d %H:%M')
+                Xp_num = Xp.apply(pd.to_numeric, errors='coerce').fillna(0.0).values
             except Exception:
-                t = str(r.get('date'))
-            hourly.append({'time': t, 'temp': int(round(r.get('mean_temp', r.get('max_temp', r.get('min_temp', 0))))), 'wind': int(r.get('wind', 0) if 'wind' in r.index else 0), 'cond': r.get('condition',''), 'precip': r.get('precipitation', 0) if 'precipitation' in r.index else 0})
-    for h in hourly:
-        try:
-            display_time = pd.to_datetime(h['time']).strftime('%a %H:%M')
-        except Exception:
-            display_time = str(h['time'])
-        icon_html = get_animated_icon(h.get('cond') or ('sunny' if h['temp'] >= 15 else 'snow'), size=40)
-        hourly_html += (
-            f"<div style='min-width:140px; border-radius:10px; padding:10px; background:var(--card-bg); text-align:center;'>"
-            f"<div style='font-weight:700'>{display_time}</div>"
-            f"{icon_html}"
-            f"<div style='font-weight:700'>{h['temp']}°C</div>"
-            f"<div style='font-size:12px'>{int(h.get('wind',0))} km/h · {h.get('precip','—')} mm</div>"
-            f"</div>"
-        )
-    hourly_html += "</div></div>"
-    st.markdown(hourly_html, unsafe_allow_html=True)
+                Xp_num = Xp.values.astype(float)
+            try:
+                pred = model_obj.predict(Xp_num)[0]
+            except Exception:
+                try:
+                    pred = model_obj.predict(Xp)[0]
+                except Exception:
+                    pred = 0.0
+            pred = float(pred)
+            new_date = (last_date + pd.Timedelta(days=i+1)).date()
+            # decide icon: >=15 => sunny, else rainy
+            if pred >= 15:
+                icon_html = "<span class='emoji-sunny' title='Sunny'>☀️</span>"
+            else:
+                icon_html = "<span class='emoji-rain' title='Rainy'>🌧️</span>"
+            out_rows.append({"date": str(new_date), "pred_mean": round(pred, 2), "icon_html": icon_html})
+            # iterative injection
+            if 'mean_temp' in last_row.columns:
+                last_row.at[last_row.index[0], 'mean_temp'] = pred
+            elif target in last_row.columns:
+                last_row.at[last_row.index[0], target] = pred
 
-# ---- Totals summary (only bottom) ----
-st.markdown("### Totals summary")
-totals, _ = weather_condition_summary(df, temp_col='mean_temp', precip_col='precipitation')
-totals_df = pd.DataFrame(list(totals.items()), columns=['metric', 'value'])
-totals_df['metric'] = totals_df['metric'].map({
-    'hot': '🔥 Hot',
-    'warm': '🌤️ Warm',
-    'cool': '🌥️ Cool',
-    'cold': '❄️ Cold',
-    'rainy_days': '🌧️ Rainy Days'
-})
-st.dataframe(totals_df.set_index('metric'))
+        forecast_df = pd.DataFrame(out_rows)
+
+        # Render forecast: if emoji chosen, show HTML table with big icons; else show numeric DataFrame
+        if use_emoji:
+            html = "<table class='forecast-table'>"
+            html += "<thead><tr><th>Date</th><th>Weather</th><th>Predicted</th></tr></thead><tbody>"
+            for r in out_rows:
+                html += f"<tr><td class='forecast-date'>{r['date']}</td><td>{r['icon_html']}</td><td class='forecast-temp'>{r['pred_mean']} °C</td></tr>"
+            html += "</tbody></table>"
+            st.markdown(html, unsafe_allow_html=True)
+        else:
+            st.dataframe(forecast_df[['date','pred_mean']].rename(columns={'pred_mean':'predicted_temp'}))
+
+        # CSV download
+        csv = forecast_df[['date','pred_mean']].rename(columns={'pred_mean':'predicted_temp'}).to_csv(index=False).encode('utf-8')
+        st.download_button("Download CSV", data=csv, file_name="forecast.csv", mime="text/csv")

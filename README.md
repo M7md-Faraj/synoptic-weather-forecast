@@ -58,6 +58,11 @@ Users can:
 * Download prediction results as CSV
 
 ---
+Pages:
+- Home: project summary + two plots.
+- EDA: summary stats, missing-value checks, correlation heatmap, distribution.
+- Models & Evaluation: trains / compares Linear Regression, Decision Tree, Random Forest with time-based split and shows MAE/RMSE/MAPE/R².
+- Forecast: use best model to make N-day forecast and download CSV.
 
 ## 🖥️ Dashboard Interface
 
