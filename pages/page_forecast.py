@@ -4,17 +4,16 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import streamlit as st
 import streamlit.components.v1 as components
-from typing import Any
+from typing import Any, Optional
 
-
-from utils.data_loader import get_monthly_medians, build_forecast_input
+from utils.data_loader import get_monthly_medians, build_forecast_input, FEATURE_COLS as DL_FEATURES
 from utils.model_utils import MODEL_NAMES, MODEL_COLORS, predict, get_best_model, load_results
 
 # ----- Animated emoji + table CSS -----
 _EMOJI_CSS = """
 <style>
 .emoji-sunny {font-size:48px; display:inline-block; animation: sun-pulse 2.6s infinite; line-height:1;}
-@keyframes sun-pulse {0%{transform:scale(1);}50%{transform:scale(1.12);}100%{transform:scale(1);}}
+@keyframes sun-pulse {0%{transform:scale(1);}50%{transform:scale(1.12);}100%{transform:scale(1);} }
 .emoji-rain {font-size:48px; display:inline-block; animation: rain-drop 1.2s infinite; line-height:1;}
 @keyframes rain-drop {0%{transform:translateY(-6px); opacity:0.75;}50%{transform:translateY(8px); opacity:1;}100%{transform:translateY(-6px); opacity:0.75;}}
 .icon-small {font-size:28px; vertical-align:middle;}
@@ -47,24 +46,60 @@ def _ensure_2d_input(x: Any):
     Accepts dict, pd.Series, 1D array, or already 2D array.
     Returns either a 2D numpy array or a pandas DataFrame with a single row.
     """
-    # If dict or pandas Series -> DataFrame with a single row (keeps column names)
     if isinstance(x, dict):
         return pd.DataFrame([x])
     if isinstance(x, pd.Series):
         return x.to_frame().T
-    # numpy array-like
     arr = np.asarray(x)
     if arr.ndim == 1:
         return arr.reshape(1, -1)
     return arr
 
 
+def _to_dataframe_with_features(x: Any, bundles: dict, model_name: str) -> pd.DataFrame:
+    """
+    Convert x (which might be a numpy array or DataFrame) to a pandas DataFrame
+    with column names matching the model bundle's 'features' list.
+    If x is already a DataFrame, return it.
+    """
+    if isinstance(x, pd.DataFrame):
+        return x
+
+    arr = np.asarray(x)
+    if arr.ndim != 2:
+        raise ValueError("Model input must be 2D at this point.")
+
+    bundle = bundles.get(model_name) if isinstance(bundles, dict) else None
+    features = None
+
+    if bundle and isinstance(bundle.get("features"), (list, tuple)):
+        features = list(bundle["features"])
+
+    if features is None and arr.shape[1] == len(DL_FEATURES):
+        features = DL_FEATURES
+
+    if features is None:
+        raise ValueError(
+            "Cannot determine feature names to build a DataFrame for prediction. "
+            "Ensure `build_forecast_input` returns a dict/Series or that model bundles include 'features'."
+        )
+
+    if arr.shape[1] != len(features):
+        raise ValueError(
+            f"Input has {arr.shape[1]} columns but model expects {len(features)} features."
+        )
+
+    return pd.DataFrame(arr, columns=features)
+
+
 def _render_cards(day_rows: list, mae: float):
-    """Render horizontally scrollable day cards (keeps the animated emoji)."""
+    """Render horizontally scrollable day cards (animated emoji)."""
     cards_html = ""
     for row in day_rows:
+        # Use numeric temp for condition and the display string for visual display
         label, emoji, accent, emoji_class = _condition(row["temp"])
         emoji_html = f'<span class="{emoji_class}">{emoji}</span>'
+        temp_display = row.get("temp_display", f"{row['temp']:.2f}")
         cards_html += f"""
         <div style="min-width:110px; max-width:110px; background:#fff;
                     border:1px solid #e2e8f0; border-top:3px solid {accent};
@@ -74,7 +109,7 @@ def _render_cards(day_rows: list, mae: float):
             <div style="font-size:0.65rem;color:#94a3b8;margin-bottom:10px;">{row["date_short"]}</div>
             <div style="font-size:1.5rem;line-height:1;margin-bottom:5px;">{emoji_html}</div>
             <div style="font-size:0.68rem;color:{accent};font-weight:600;margin-bottom:8px;">{label}</div>
-            <div style="font-size:1.65rem;font-weight:800;color:#0f172a;margin-bottom:3px;">{row["temp"]:.1f}&deg;</div>
+            <div style="font-size:1.65rem;font-weight:800;color:#0f172a;margin-bottom:3px;">{temp_display}&deg;</div>
             <div style="font-size:0.57rem;color:#94a3b8;border-top:1px solid #f1f5f9;padding-top:5px;margin-top:6px;">&plusmn;{mae:.2f}&deg;C</div>
         </div>"""
 
@@ -95,16 +130,18 @@ def _prediction_table_html(fdf: pd.DataFrame, mae: float):
     for _, r in fdf.iterrows():
         label, emoji, accent, emoji_class = _condition(r["Predicted Mean Temp (°C)"])
         emoji_html = f'<span class="{emoji_class}">{emoji}</span>'
+        # use the display string if available (1 or 2 dp), and include exact 2dp in the title
+        temp_display = r.get("Temp Display", f"{r['Predicted Mean Temp (°C)']:.2f}")
+        exact2 = f"{r['Predicted Mean Temp (°C)']:.2f}"
         rows += (
-            f"<tr>"
+            "<tr>"
             f"<td class='forecast-date'>{r['Date']}<br><small>{r['Day']}</small></td>"
             f"<td>{emoji_html}<br><small style='color:{accent};font-weight:600;'>{label}</small></td>"
-            f"<td class='forecast-temp'>{r['Predicted Mean Temp (°C)']:.1f}°</td>"
+            f"<td class='forecast-temp' title='{exact2}°'>{temp_display}°</td>"
             f"<td>±{mae:.2f}°C</td>"
-            f"</tr>"
+            "</tr>"
         )
 
-    # wrapper ensures table scrolls if too tall
     html = f"""
     {_EMOJI_CSS}
     <div style="width:100%; max-height:420px; overflow:auto; border:1px solid #eef2f7; border-radius:8px; padding:8px; background:#ffffff;">
@@ -124,8 +161,8 @@ def _prediction_table_html(fdf: pd.DataFrame, mae: float):
 def render(df, bundles, selected_model=None):
     """
     Render forecast UI. selected_model is optional and used as the selectbox default.
-    This implementation ensures each day's inputs are built separately and shaped correctly,
-    so predictions vary day-to-day.
+    Ensures each day's inputs are built separately and are converted to DataFrame
+    with correct feature names so predictions vary day-to-day.
     """
     results = load_results()
     best_name = get_best_model(results)
@@ -158,17 +195,27 @@ def render(df, bundles, selected_model=None):
                 # build the feature row for this date (should include cyclical/day encodings)
                 raw_input = build_forecast_input(d, monthly_meds)
 
-                # ensure the row is 2D or a single-row DataFrame so model sees day-specific features
+                # ensure the row is 2D or a single-row DataFrame/array
                 X_input = _ensure_2d_input(raw_input)
 
-                # call predict: utils.model_utils.predict should accept DataFrame/ndarray with one row
-                pred_arr = predict(bundles, selected_model_local, X_input)
+                # if we got an ndarray, convert to DataFrame using the bundle's features
+                if isinstance(X_input, np.ndarray):
+                    try:
+                        X_df = _to_dataframe_with_features(X_input, bundles, selected_model_local)
+                    except Exception as e:
+                        # show a clear error in the app and abort the generation
+                        st.error(f"Prediction input error: {e}")
+                        return
+                else:
+                    # X_input is already a DataFrame
+                    X_df = X_input
 
-                # defensive: predict may return array-like of shape (n, ) or list; take first value
+                # call predict and take the first element
                 try:
+                    pred_arr = predict(bundles, selected_model_local, X_df)
                     pred_val = float(np.asarray(pred_arr).ravel()[0])
-                except Exception:
-                    # fallback: if predict failed, set NaN so user sees error
+                except Exception as e:
+                    st.error(f"Prediction failed: {e}")
                     pred_val = float("nan")
 
                 rows.append({
@@ -181,6 +228,27 @@ def render(df, bundles, selected_model=None):
                 })
 
             fdf = pd.DataFrame(rows)
+
+            # ----------------------
+            # DECIDE DISPLAY PRECISION
+            # ----------------------
+            # If rounding to 1 decimal collapses many unique values (i.e., hides variability),
+            # prefer showing 2 decimal places in the UI. Otherwise show 1 dp for compactness.
+            try:
+                # handle possible NaNs robustly
+                numeric_series = fdf["Predicted Mean Temp (°C)"].dropna().astype(float)
+                if numeric_series.empty:
+                    dp = 2
+                else:
+                    collapsed_unique = numeric_series.round(1).nunique()
+                    # threshold: if 1dp results in too few unique values, switch to 2dp
+                    dp = 2 if collapsed_unique <= max(3, len(fdf) // 4) else 1
+            except Exception:
+                dp = 2
+
+            fdf["Temp Display"] = fdf["Predicted Mean Temp (°C)"].map(lambda x: f"{x:.{dp}f}")
+
+            # save to session state
             st.session_state["forecast_df"] = fdf
             st.session_state["forecast_model"] = selected_model_local
             st.session_state["forecast_horizon"] = n_days
@@ -201,6 +269,7 @@ def render(df, bundles, selected_model=None):
 
     with col_left:
         first_temp = float(temps.iloc[0])
+        first_temp_display = fdf["Temp Display"].iloc[0]
         first_label, first_emoji, first_accent, _ = _condition(first_temp)
         first_date = pd.to_datetime(fdf["Date"].iloc[0])
         date_str = first_date.strftime("%A, %-d %B %Y")
@@ -209,7 +278,7 @@ def render(df, bundles, selected_model=None):
             <div style="padding:20px;border-radius:10px;border:1px solid rgba(128,128,128,0.15);">
               <div style="font-size:0.72rem;opacity:0.7;margin-bottom:6px;">First predicted day</div>
               <div style="font-size:0.82rem;opacity:0.7;margin-bottom:12px;">{date_str}</div>
-              <div style="font-size:4rem;font-weight:700;color:{first_accent};line-height:1;margin-bottom:6px;">{first_temp:.1f}°</div>
+              <div style="font-size:4rem;font-weight:700;color:{first_accent};line-height:1;margin-bottom:6px;">{first_temp_display}°</div>
               <div style="font-size:1rem;font-weight:600;color:{first_accent};margin-bottom:6px;">{first_emoji} {first_label}</div>
               <div style="font-size:0.72rem;opacity:0.65;margin-top:12px;border-top:1px solid rgba(128,128,128,0.12);padding-top:10px;">
                 Model: {forecast_model}<br>Accuracy band: ±{mae:.2f}°C<br>Horizon: {forecast_horizon} days
@@ -243,19 +312,30 @@ def render(df, bundles, selected_model=None):
     st.markdown("---")
     st.markdown("#### Day-by-Day Forecast")
     st.caption(f"Showing all {forecast_horizon} predicted days — scroll to browse.")
-    card_data = [{"day": r["_day_short"], "date_short": r["_date_short"], "temp": r["Predicted Mean Temp (°C)"]} for _, r in fdf.iterrows()]
+    card_data = [
+        {
+            "day": r["_day_short"],
+            "date_short": r["_date_short"],
+            "temp": r["Predicted Mean Temp (°C)"],
+            "temp_display": r["Temp Display"],
+        }
+        for _, r in fdf.iterrows()
+    ]
     _render_cards(card_data, mae)
 
     st.markdown("---")
     st.markdown("#### Full Prediction Table")
     html = _prediction_table_html(fdf, mae)
 
-    # compute height: ~80 px header overhead + ~40 px per row (cap height)
+    # compute height and render via components.html for reliable styling
     row_count = len(fdf)
     height = min(100 + row_count * 44, 720)
     components.html(html, height=height, scrolling=True)
 
-    csv_bytes = fdf[["Date", "Day", "Month", "Predicted Mean Temp (°C)"]].to_csv(index=False).encode("utf-8")
+    # CSV: ensure Predicted column is formatted to 2 dp to match file expectation
+    csv_out = fdf[["Date", "Day", "Month", "Predicted Mean Temp (°C)"]].copy()
+    csv_out["Predicted Mean Temp (°C)"] = csv_out["Predicted Mean Temp (°C)"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
+    csv_bytes = csv_out.to_csv(index=False).encode("utf-8")
     st.download_button(label="Download CSV", data=csv_bytes, file_name=f"london_forecast_{forecast_model.replace(' ','_')}_{forecast_horizon}d.csv", mime="text/csv")
 
     st.divider()
@@ -268,5 +348,4 @@ def render(df, bundles, selected_model=None):
             so predictions vary day-to-day even when monthly medians are used for other inputs.
 
             This remains a climatological estimate, not a live operational forecast.
-            """
-        )
+            """)

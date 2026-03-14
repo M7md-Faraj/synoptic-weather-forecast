@@ -5,14 +5,14 @@
     "R2": 0.9631
   },
   "Decision Tree": {
-    "MAE": 0.9829,
-    "RMSE": 1.2948,
-    "R2": 0.9477
+    "MAE": 0.9423,
+    "RMSE": 1.2396,
+    "R2": 0.9521
   },
   "Random Forest": {
-    "MAE": 0.8102,
-    "RMSE": 1.0778,
-    "R2": 0.9638
+    "MAE": 0.8167,
+    "RMSE": 1.0839,
+    "R2": 0.9634
   },
   "best_model": "Random Forest"
 }
