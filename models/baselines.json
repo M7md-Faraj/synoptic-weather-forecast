@@ -1,0 +1,12 @@
+{
+  "Persistence (lag-1)": {
+    "MAE": 1.5947,
+    "RMSE": 2.0432,
+    "R2": 0.8698
+  },
+  "Climatology (monthly mean)": {
+    "MAE": 2.3752,
+    "RMSE": 3.0021,
+    "R2": 0.7189
+  }
+}
