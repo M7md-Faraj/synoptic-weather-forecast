@@ -4,7 +4,7 @@ import streamlit as st
 from utils.data_loader import MONTH_LABELS
 
 def render(df):
-    st.title("London Daily Temperature — ML demo")
+    st.title("London Daily Temperature")
     st.write("A compact demo comparing 3 regression algorithms on historical daily data.")
     st.divider()
 

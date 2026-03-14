@@ -50,7 +50,7 @@ df = get_data()
 bundles = get_bundles()
 
 with st.sidebar:
-    st.markdown("### 🌤 London Temperature — Demo")
+    st.markdown("### London Temperature Forecasting")
     st.caption("Synoptic ML project")
     st.divider()
 
@@ -131,7 +131,6 @@ with st.sidebar:
                 st.exception(f"Retraining failed: {e}")
 
     st.divider()
-    st.caption("Academic demo — historical data only.")
 
 from pages import page_home, page_eda, page_models, page_forecast
 
@@ -152,5 +151,3 @@ elif page == "Forecast":
         st.error("Model files not found. Retrain from the sidebar first.")
     else:
         page_forecast.render(df, bundles, selected_model=model_choice)
-
-st.markdown('<div class="app-footer">Academic demo — historical data only.</div>', unsafe_allow_html=True)
