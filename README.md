@@ -7,9 +7,14 @@ This focused submission demonstrates a clear ML pipeline: preprocessing, EDA, mo
 
 ---
 
-![Overview screensho](image-5.png)
+![Overview screenshot](image-1.png)
 
-![alt text](image-6.png)
+![Home Page](image-2.png)
+
+![Home Page](image-3.png)
+
+![Home Page](image-4.png)
+
 
 ## 🚀 Features
 

@@ -10,9 +10,9 @@
     "R2": 0.9521
   },
   "Random Forest": {
-    "MAE": 0.8167,
-    "RMSE": 1.0839,
-    "R2": 0.9634
+    "MAE": 0.8096,
+    "RMSE": 1.0776,
+    "R2": 0.9638
   },
   "best_model": "Random Forest"
 }
