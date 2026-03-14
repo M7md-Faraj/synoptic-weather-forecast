@@ -26,7 +26,7 @@ def render(df, bundles):
     st.divider()
 
     # Train/test split explanation (chronological)
-    st.subheader("1. Train / test split")
+    st.subheader("Train / test split")
     df_clean = df.dropna(subset=[TARGET_COL])
     n = len(df_clean)
     split = int(n * 0.8)
@@ -52,7 +52,7 @@ def render(df, bundles):
     st.divider()
 
     # Features and target
-    st.subheader("2. Features and target")
+    st.subheader("Features and target")
     col_feat, col_tgt = st.columns([3, 2])
     with col_feat:
         st.markdown(f"**{len(FEATURE_COLS)} features** used as inputs:")
@@ -72,7 +72,7 @@ def render(df, bundles):
     st.divider()
 
     # Results table
-    st.subheader("3. Model results (test set)")
+    st.subheader("Model results (test set)")
     results_df = build_results_table(results)
     best_name = get_best_model(results)
     st.dataframe(results_df, use_container_width=True, hide_index=True)
@@ -83,7 +83,7 @@ def render(df, bundles):
     st.divider()
 
     # Metric comparisons
-    st.subheader("4. Metric comparison")
+    st.subheader("Metric comparison")
     mae_vals = [results.get(m, {}).get("MAE", 0) for m in MODEL_NAMES]
     rmse_vals = [results.get(m, {}).get("RMSE", 0) for m in MODEL_NAMES]
     r2_vals = [results.get(m, {}).get("R2", 0) for m in MODEL_NAMES]
@@ -107,7 +107,7 @@ def render(df, bundles):
     st.divider()
 
     # Predicted vs actual
-    st.subheader(f"5. Predicted vs actual — {best_name}")
+    st.subheader(f"Predicted vs actual — {best_name}")
     test_preds = get_test_predictions(bundles, df)
     y_actual, y_pred, dates = test_preds[best_name]
     valid_mask = ~(np.isnan(y_actual) | np.isnan(y_pred))
@@ -142,7 +142,7 @@ def render(df, bundles):
     st.divider()
 
     # Random Forest feature importance
-    st.subheader("6. Random Forest feature importance")
+    st.subheader("Random Forest feature importance")
     fi_df = get_feature_importance(bundles)
     def feature_group_colour(name):
         if any(x in name for x in ("lag", "rolling")):

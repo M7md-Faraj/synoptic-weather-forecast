@@ -12,12 +12,12 @@ def render(df):
     st.divider()
 
     # Dataset preview
-    st.subheader("1. Dataset preview")
+    st.subheader("Dataset preview", anchor="dataset-preview", help="First 10 rows of the dataset with key features. Note that engineered features are excluded here for clarity.")
     raw_cols = ["date", "cloud_cover", "sunshine", "global_radiation", "max_temp", "mean_temp", "min_temp", "precipitation", "pressure", "snow_depth"]
     available = [c for c in raw_cols if c in df.columns]
     st.dataframe(df[available].head(10), use_container_width=True)
 
-    with st.expander("Column descriptions"):
+    with st.expander("Column descriptions", expanded=False):
         st.markdown("""
         | Column | Unit | Notes |
         |---|---|---|
@@ -35,7 +35,7 @@ def render(df):
     st.divider()
 
     # Summary stats
-    st.subheader("2. Summary statistics")
+    st.subheader("Summary statistics", anchor="summary-statistics", help="Basic stats for key features. Note that engineered features are excluded here as they are derived from the raw features and would not provide additional insight at this stage.")
     stat_cols = ["max_temp", "mean_temp", "min_temp", "precipitation", "cloud_cover", "sunshine", "global_radiation"]
     stat_cols = [c for c in stat_cols if c in df.columns]
     desc = df[stat_cols].describe().round(2)
@@ -44,7 +44,7 @@ def render(df):
     st.divider()
 
     # Missing values
-    st.subheader("3. Missing values")
+    st.subheader("Missing values", anchor="missing-values", help="Missing value counts and percentages for key features. Snow depth is handled by filling NaN with zero, as it indicates no snow.")
     check_cols = ["cloud_cover", "sunshine", "global_radiation", "max_temp", "mean_temp", "min_temp", "precipitation", "pressure", "snow_depth"]
     check_cols = [c for c in check_cols if c in df.columns]
     missing_counts = df[check_cols].isnull().sum()
@@ -79,7 +79,7 @@ def render(df):
     st.divider()
 
     # Preprocessing notes
-    st.subheader("4. Preprocessing & feature engineering (summary)")
+    st.subheader("Preprocessing & feature engineering (summary)")
     st.markdown("""
     Steps applied in data loading:
     1. Sort by date.
@@ -94,7 +94,7 @@ def render(df):
     st.divider()
 
     # Correlation heatmap
-    st.subheader("5. Correlation heatmap")
+    st.subheader("Correlation heatmap", anchor="correlation-heatmap", help="Pearson correlation between raw features and target. Engineered features are excluded to avoid spurious correlations.")
     heatmap_cols = ["mean_temp", "max_temp", "min_temp", "cloud_cover", "sunshine", "global_radiation", "precipitation", "pressure", "snow_depth"]
     heatmap_cols = [c for c in heatmap_cols if c in df.columns]
     corr_df = df[heatmap_cols].dropna().corr()
@@ -109,7 +109,7 @@ def render(df):
     st.divider()
 
     # Distribution of mean temperature
-    st.subheader("6. Distribution of mean temperature")
+    st.subheader("Distribution of mean temperature")
     temp_vals = df["mean_temp"].dropna()
     fig, ax = plt.subplots(figsize=(9, 3.8))
     ax.hist(temp_vals, bins=60, alpha=0.72, edgecolor="white", linewidth=0.4)
@@ -132,7 +132,7 @@ def render(df):
     st.divider()
 
     # Key findings
-    st.subheader("7. Key findings")
+    st.subheader("Key findings")
     st.markdown("""
     - Strong lag-1 autocorrelation: yesterday's temperature is the single strongest predictor.
     - Clear seasonal cycle: cyclical encoding is necessary.
