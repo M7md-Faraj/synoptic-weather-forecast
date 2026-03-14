@@ -3,7 +3,6 @@
 A **machine learning powered weather analysis and forecasting dashboard** built with **Python, Streamlit, and Scikit-learn**.  
 This focused submission demonstrates a clear ML pipeline: preprocessing, EDA, model comparison, evaluation, and a short forecasting interface.
 
-> **Note:** This repository is prepared for an academic submission/demonstration. Do **not** include the `venv/` folder in your ZIP or git history.
 
 ---
 
