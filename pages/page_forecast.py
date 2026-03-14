@@ -1,13 +1,16 @@
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import streamlit as st
 import streamlit.components.v1 as components
+from typing import Any
+
 
 from utils.data_loader import get_monthly_medians, build_forecast_input
 from utils.model_utils import MODEL_NAMES, MODEL_COLORS, predict, get_best_model, load_results
 
-# ----- Animated emoji CSS -----
+# ----- Animated emoji + table CSS -----
 _EMOJI_CSS = """
 <style>
 .emoji-sunny {font-size:48px; display:inline-block; animation: sun-pulse 2.6s infinite; line-height:1;}
@@ -25,6 +28,7 @@ _EMOJI_CSS = """
 
 
 def _condition(temp_c: float):
+    """Return label, emoji, color and CSS class for a temperature."""
     if temp_c >= 20:
         return "Warm", "☀️", "#f59e0b", "emoji-sunny"
     elif temp_c >= 14:
@@ -37,11 +41,29 @@ def _condition(temp_c: float):
         return "Freezing", "❄️", "#0ea5e9", "emoji-rain"
 
 
+def _ensure_2d_input(x: Any):
+    """
+    Ensure the model input is a 2D array-like suitable for predict(...).
+    Accepts dict, pd.Series, 1D array, or already 2D array.
+    Returns either a 2D numpy array or a pandas DataFrame with a single row.
+    """
+    # If dict or pandas Series -> DataFrame with a single row (keeps column names)
+    if isinstance(x, dict):
+        return pd.DataFrame([x])
+    if isinstance(x, pd.Series):
+        return x.to_frame().T
+    # numpy array-like
+    arr = np.asarray(x)
+    if arr.ndim == 1:
+        return arr.reshape(1, -1)
+    return arr
+
+
 def _render_cards(day_rows: list, mae: float):
+    """Render horizontally scrollable day cards (keeps the animated emoji)."""
     cards_html = ""
     for row in day_rows:
         label, emoji, accent, emoji_class = _condition(row["temp"])
-        # wrap emoji in span with the CSS class
         emoji_html = f'<span class="{emoji_class}">{emoji}</span>'
         cards_html += f"""
         <div style="min-width:110px; max-width:110px; background:#fff;
@@ -68,7 +90,7 @@ def _render_cards(day_rows: list, mae: float):
 
 
 def _prediction_table_html(fdf: pd.DataFrame, mae: float):
-    # simple HTML table with classes so CSS colors and spacing apply
+    """Return a complete HTML fragment (CSS + table) for the prediction table (scrollable)."""
     rows = ""
     for _, r in fdf.iterrows():
         label, emoji, accent, emoji_class = _condition(r["Predicted Mean Temp (°C)"])
@@ -81,9 +103,12 @@ def _prediction_table_html(fdf: pd.DataFrame, mae: float):
             f"<td>±{mae:.2f}°C</td>"
             f"</tr>"
         )
+
+    # wrapper ensures table scrolls if too tall
     html = f"""
-    <div>
-      <table class="forecast-table">
+    {_EMOJI_CSS}
+    <div style="width:100%; max-height:420px; overflow:auto; border:1px solid #eef2f7; border-radius:8px; padding:8px; background:#ffffff;">
+      <table class="forecast-table" role="table" aria-label="Full prediction table">
         <thead>
           <tr><th>Date</th><th>Condition</th><th>Predicted (°C)</th><th>Accuracy (MAE)</th></tr>
         </thead>
@@ -93,11 +118,15 @@ def _prediction_table_html(fdf: pd.DataFrame, mae: float):
       </table>
     </div>
     """
-    return _EMOJI_CSS + html
+    return html
 
 
 def render(df, bundles, selected_model=None):
-    """Render forecast UI. selected_model is optional: if provided, it is used."""
+    """
+    Render forecast UI. selected_model is optional and used as the selectbox default.
+    This implementation ensures each day's inputs are built separately and shaped correctly,
+    so predictions vary day-to-day.
+    """
     results = load_results()
     best_name = get_best_model(results)
 
@@ -126,13 +155,27 @@ def render(df, bundles, selected_model=None):
 
             rows = []
             for d in forecast_dates:
-                X_row = build_forecast_input(d, monthly_meds)
-                pred = float(predict(bundles, selected_model_local, X_row)[0])
+                # build the feature row for this date (should include cyclical/day encodings)
+                raw_input = build_forecast_input(d, monthly_meds)
+
+                # ensure the row is 2D or a single-row DataFrame so model sees day-specific features
+                X_input = _ensure_2d_input(raw_input)
+
+                # call predict: utils.model_utils.predict should accept DataFrame/ndarray with one row
+                pred_arr = predict(bundles, selected_model_local, X_input)
+
+                # defensive: predict may return array-like of shape (n, ) or list; take first value
+                try:
+                    pred_val = float(np.asarray(pred_arr).ravel()[0])
+                except Exception:
+                    # fallback: if predict failed, set NaN so user sees error
+                    pred_val = float("nan")
+
                 rows.append({
                     "Date": d.strftime("%Y-%m-%d"),
                     "Day": d.strftime("%A"),
                     "Month": d.strftime("%B"),
-                    "Predicted Mean Temp (°C)": round(pred, 2),
+                    "Predicted Mean Temp (°C)": round(pred_val, 2),
                     "_day_short": d.strftime("%a"),
                     "_date_short": d.strftime("%-d %b"),
                 })
@@ -205,9 +248,12 @@ def render(df, bundles, selected_model=None):
 
     st.markdown("---")
     st.markdown("#### Full Prediction Table")
-    # render HTML table with emoji CSS
     html = _prediction_table_html(fdf, mae)
-    st.markdown(html, unsafe_allow_html=True)
+
+    # compute height: ~80 px header overhead + ~40 px per row (cap height)
+    row_count = len(fdf)
+    height = min(100 + row_count * 44, 720)
+    components.html(html, height=height, scrolling=True)
 
     csv_bytes = fdf[["Date", "Day", "Month", "Predicted Mean Temp (°C)"]].to_csv(index=False).encode("utf-8")
     st.download_button(label="Download CSV", data=csv_bytes, file_name=f"london_forecast_{forecast_model.replace(' ','_')}_{forecast_horizon}d.csv", mime="text/csv")
@@ -218,6 +264,9 @@ def render(df, bundles, selected_model=None):
             """
             Inputs: monthly medians from the historical record are used as stand-ins
             for atmospheric features. Lag features are approximated by month medians.
-            This is a climatological estimate rather than a live, operational forecast.
+            Cyclical encodings (month/day-of-year sin/cos) are specific to each date,
+            so predictions vary day-to-day even when monthly medians are used for other inputs.
+
+            This remains a climatological estimate, not a live operational forecast.
             """
         )

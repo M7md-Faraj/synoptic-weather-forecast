@@ -175,7 +175,7 @@ def train_and_save(hyperparams=None, progress_callback=None):
     _report(90, f"Best model: {best_name} (R²={best_r2:.4f})")
 
     _report(92, "Saving model bundles and results...")
-    joblib.dump(bundles, os.path.join(MODELS_DIR, "academic_models.pkl"))
+    joblib.dump(bundles, os.path.join(MODELS_DIR, "trained_models.pkl"))
     with open(os.path.join(MODELS_DIR, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
 

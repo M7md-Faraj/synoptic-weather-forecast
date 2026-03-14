@@ -17,7 +17,7 @@ import pandas as pd
 
 # ─── File path ──────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_PATH  = os.path.join(BASE_DIR, "data", "london_weather.csv")
+DATA_PATH  = os.path.join(BASE_DIR, "data", "weather.csv")
 
 # ─── Month / season label helpers ───────────────────────────────────────────
 MONTH_LABELS  = ["Jan","Feb","Mar","Apr","May","Jun",
