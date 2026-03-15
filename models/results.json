@@ -2,17 +2,21 @@
   "Linear Regression": {
     "MAE": 0.8038,
     "RMSE": 1.0879,
-    "R2": 0.9631
+    "R2": 0.9631,
+    "MAPE%": 11.458
   },
   "Decision Tree": {
     "MAE": 0.9423,
     "RMSE": 1.2396,
-    "R2": 0.9521
+    "R2": 0.9521,
+    "MAPE%": 12.846
   },
   "Random Forest": {
-    "MAE": 0.8096,
-    "RMSE": 1.0776,
-    "R2": 0.9638
+    "MAE": 0.8167,
+    "RMSE": 1.0839,
+    "R2": 0.9634,
+    "MAPE%": 11.689
   },
-  "best_model": "Random Forest"
+  "best_model": "Random Forest",
+  "timestamp": "2026-03-15T11:09:41.467688"
 }

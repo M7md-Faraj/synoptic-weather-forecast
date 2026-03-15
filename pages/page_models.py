@@ -2,170 +2,265 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
+import traceback
+
+from sklearn.impute import SimpleImputer
 
 from utils.data_loader import FEATURE_COLS, TARGET_COL
 from utils.model_utils import (
     MODEL_NAMES, MODEL_COLORS,
     build_results_table, get_best_model, get_test_predictions,
-    get_feature_importance, load_results, load_baselines
+    get_feature_importance, load_results, load_baselines, time_series_cv, load_model_bundles
 )
 
+
+def _ensure_date_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Make sure df has a canonical 'date' column (try common names / parsing)."""
+    df = df.copy()
+    if 'date' in df.columns:
+        return df
+    # try some common alternatives
+    for cand in ['datetime', 'timestamp', 'time', 'day', 'recorded_at']:
+        if cand in df.columns:
+            try:
+                df['date'] = pd.to_datetime(df[cand], errors='coerce', infer_datetime_format=True)
+                return df
+            except Exception:
+                continue
+    # try parse any column that looks like dates
+    for c in df.columns:
+        try:
+            parsed = pd.to_datetime(df[c].astype(str), errors='coerce', infer_datetime_format=True)
+            if parsed.notna().sum() >= max(1, int(len(df) * 0.2)):
+                df['date'] = parsed
+                return df
+        except Exception:
+            continue
+    # fallback: use index as timestamp
+    try:
+        df['date'] = pd.to_datetime(df.index, errors='coerce')
+    except Exception:
+        df['date'] = pd.Timestamp.now()
+    return df
+
+
 def render(df, bundles):
-    # If retraining progress exists in session state, show it here
+    # show training progress if present
     tp = st.session_state.get("training_progress")
     if tp and tp.get("percent", 100) < 100:
         st.warning(f"Training in progress: {tp.get('message', '')}")
         st.progress(tp.get("percent", 0))
         st.divider()
 
-    results = load_results()
-    baselines = load_baselines()
+    results = load_results() or {}
+    baselines = load_baselines() or {}
 
-    st.title("Models & Evaluation")
-    st.write("Training setup and comparison of the three models.")
+    st.title("Models & Evaluation — Details")
+    st.write("Training setup, baselines, cross-validation and diagnostic plots.")
     st.divider()
 
-    # Train/test split explanation (chronological)
-    st.subheader("Train / test split")
-    df_clean = df.dropna(subset=[TARGET_COL])
+    # Prepare data: ensure date and drop rows where target is missing (we cannot train on those)
+    df_proc = _ensure_date_column(df)
+    df_clean = df_proc.dropna(subset=[TARGET_COL]).reset_index(drop=True)
+    if df_clean.empty:
+        st.error("No rows with a valid target column present. Check your dataset and target mapping.")
+        return
+
+    # Chronological split
     n = len(df_clean)
-    split = int(n * 0.8)
+    split = max(1, int(n * 0.8))
     train_df = df_clean.iloc[:split]
     test_df = df_clean.iloc[split:]
 
     col_info, col_bar = st.columns([3, 2])
     with col_info:
+        try:
+            tmin = pd.to_datetime(train_df['date']).min().date()
+            tmax = pd.to_datetime(train_df['date']).max().date()
+            tmin_t = pd.to_datetime(test_df['date']).min().date()
+            tmax_t = pd.to_datetime(test_df['date']).max().date()
+        except Exception:
+            tmin = train_df['date'].iloc[0] if not train_df.empty else "N/A"
+            tmax = train_df['date'].iloc[-1] if not train_df.empty else "N/A"
+            tmin_t = test_df['date'].iloc[0] if not test_df.empty else "N/A"
+            tmax_t = test_df['date'].iloc[-1] if not test_df.empty else "N/A"
+
         st.markdown(f"""
         | | Train set | Test set |
         |---|---:|---:|
-        | Period | {train_df['date'].min().date()} → {train_df['date'].max().date()} | {test_df['date'].min().date()} → {test_df['date'].max().date()} |
-        | Size | {len(train_df):,} (80%) | {len(test_df):,} (20%) |
+        | Period | {tmin} → {tmax} | {tmin_t} → {tmax_t} |
+        | Size | {len(train_df):,} (≈{int(100*len(train_df)/n)}%) | {len(test_df):,} (≈{int(100*len(test_df)/n)}%) |
         """)
-        st.warning("Split is chronological (no shuffle). This prevents data leakage for time-series.")
+        st.warning("Chronological split avoids leakage for time-series.")
     with col_bar:
         fig, ax = plt.subplots(figsize=(5, 1.6))
-        ax.barh([""], [0.8], color="#2563eb", height=0.5)
-        ax.barh([""], [0.2], left=0.8, color="#dc2626", height=0.5)
-        ax.set_xlim(0, 1); ax.set_yticks([]); ax.set_title("Chronological 80/20 split")
+        ax.barh([""], [len(train_df)/max(1, n)], color="#2563eb", height=0.5)
+        ax.barh([""], [len(test_df)/max(1, n)], left=len(train_df)/max(1, n), color="#dc2626", height=0.5)
+        ax.set_xlim(0, 1); ax.set_yticks([]); ax.set_title("Chronological split")
         plt.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close()
 
     st.divider()
 
-    # Features and target
-    st.subheader("Features and target")
-    col_feat, col_tgt = st.columns([3, 2])
-    with col_feat:
-        st.markdown(f"**{len(FEATURE_COLS)} features** used as inputs:")
-        feat_groups = {
-            "Raw atmospheric": FEATURE_COLS[:6],
-            "Cyclical encoding": FEATURE_COLS[6:10],
-            "Calendar / ordinal": FEATURE_COLS[10:12],
-            "Lag & rolling": FEATURE_COLS[12:],
-        }
-        for group, features in feat_groups.items():
-            with st.expander(group):
-                st.code(", ".join(features))
-    with col_tgt:
-        st.markdown("**Target variable:**")
-        st.info(f"`{TARGET_COL}` — Daily mean temperature (°C)")
+    # Features & Feature groups display (safe guards)
+    st.subheader("Features & groups (feature engineering)")
+    available_feats = [c for c in FEATURE_COLS if c in df_clean.columns]
+    st.markdown(f"**{len(available_feats)} features** detected for modelling (from FEATURE_COLS).")
+    feat_groups = {
+        "Raw atmospheric": available_feats[:6],
+        "Cyclical encoding": available_feats[6:10],
+        "Calendar / ordinal": available_feats[10:12],
+        "Lag & rolling": available_feats[12:],
+    }
+    for group, feats in feat_groups.items():
+        with st.expander(group, expanded=False):
+            st.write(", ".join(feats) if feats else "—")
 
     st.divider()
 
-    # Results table
-    st.subheader("Model results (test set)")
-    results_df = build_results_table(results)
-    best_name = get_best_model(results)
-    st.dataframe(results_df, use_container_width=True, hide_index=True)
+    # Baseline comparison and model results
+    st.subheader("Baseline comparison vs. models (test set)")
+    if baselines:
+        st.markdown("**Baselines (test set)**")
+        bl_rows = []
+        for name, metrics in baselines.items():
+            bl_rows.append({
+                "Name": name,
+                "MAE (°C)": metrics.get("MAE"),
+                "RMSE (°C)": metrics.get("RMSE"),
+                "MAPE (%)": metrics.get("MAPE%"),
+                "R²": metrics.get("R2")
+            })
+        st.table(pd.DataFrame(bl_rows))
+    else:
+        st.info("Baselines not available — run training to compute baselines.")
 
+    st.markdown("**Model results (test set)**")
+    results_df = build_results_table(results)
+    st.dataframe(results_df, use_container_width=True, hide_index=True)
+    best_name = get_best_model(results)
     best_r2 = results.get(best_name, {}).get("R2", 0)
     st.success(f"Best model: {best_name} (R²={best_r2:.4f})")
 
-    st.divider()
-
-    # Metric comparisons
-    st.subheader("Metric comparison")
-    mae_vals = [results.get(m, {}).get("MAE", 0) for m in MODEL_NAMES]
-    rmse_vals = [results.get(m, {}).get("RMSE", 0) for m in MODEL_NAMES]
-    r2_vals = [results.get(m, {}).get("R2", 0) for m in MODEL_NAMES]
-    colours = [MODEL_COLORS[m] for m in MODEL_NAMES]
+    # Metric comparison graphs
+    st.subheader("Metric comparison (MAE, RMSE, MAPE%)")
+    mae_vals = [results.get(m, {}).get("MAE", np.nan) for m in MODEL_NAMES]
+    rmse_vals = [results.get(m, {}).get("RMSE", np.nan) for m in MODEL_NAMES]
+    mape_vals = [results.get(m, {}).get("MAPE%", np.nan) for m in MODEL_NAMES]
+    colours = [MODEL_COLORS.get(m, "#333") for m in MODEL_NAMES]
 
     fig, axes = plt.subplots(1, 3, figsize=(13, 4.0))
-    for ax, vals, title, lower_is_better in [
-        (axes[0], mae_vals, "MAE (°C)", True),
-        (axes[1], rmse_vals, "RMSE (°C)", True),
-        (axes[2], r2_vals, "R²", False),
-    ]:
-        best_val = min(vals) if lower_is_better else max(vals)
-        bar_clrs = ["#16a34a" if abs(v - best_val) < 1e-9 else c for v, c in zip(vals, colours)]
-        bars = ax.bar(MODEL_NAMES, vals, color=bar_clrs, alpha=0.85, width=0.55)
-        ax.set_title(title, fontsize=9); ax.grid(True, axis="y", alpha=0.4)
-        for bar, val in zip(bars, vals):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003 * max(vals), f"{val:.4f}", ha="center", va="bottom", fontsize=8.5)
-        if not lower_is_better:
-            ax.set_ylim(min(vals) - 0.01, 1.0)
+    # MAE
+    bars = axes[0].bar(MODEL_NAMES, mae_vals, color=colours, alpha=0.85, width=0.55)
+    axes[0].set_title("MAE (°C)", fontsize=9); axes[0].grid(True, axis="y", alpha=0.4)
+    for bar, val in zip(bars, mae_vals):
+        if np.isfinite(val):
+            axes[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003 * max(mae_vals + [1e-6]), f"{val:.4f}", ha="center", va="bottom", fontsize=8.5)
+    # RMSE
+    bars = axes[1].bar(MODEL_NAMES, rmse_vals, color=colours, alpha=0.85, width=0.55)
+    axes[1].set_title("RMSE (°C)", fontsize=9); axes[1].grid(True, axis="y", alpha=0.4)
+    for bar, val in zip(bars, rmse_vals):
+        if np.isfinite(val):
+            axes[1].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003 * max(rmse_vals + [1e-6]), f"{val:.4f}", ha="center", va="bottom", fontsize=8.5)
+    # MAPE%
+    bars = axes[2].bar(MODEL_NAMES, mape_vals, color=colours, alpha=0.85, width=0.55)
+    axes[2].set_title("MAPE (%)", fontsize=9); axes[2].grid(True, axis="y", alpha=0.4)
+    for bar, val in zip(bars, mape_vals):
+        if np.isfinite(val):
+            axes[2].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003 * max(mape_vals + [1e-6]), f"{val:.3f}%", ha="center", va="bottom", fontsize=8.5)
     plt.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close()
-    st.divider()
-
-    # Predicted vs actual
-    st.subheader(f"Predicted vs actual — {best_name}")
-    test_preds = get_test_predictions(bundles, df)
-    y_actual, y_pred, dates = test_preds[best_name]
-    valid_mask = ~(np.isnan(y_actual) | np.isnan(y_pred))
-    y_actual = y_actual[valid_mask]; y_pred = y_pred[valid_mask]
-
-    rng = np.random.default_rng(42)
-    n_pts = min(2000, len(y_actual))
-    idx = np.sort(rng.choice(len(y_actual), n_pts, replace=False))
-    residuals = y_pred - y_actual
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
-    lims = [float(min(y_actual.min(), y_pred.min())) - 1, float(max(y_actual.max(), y_pred.max())) + 1]
-    axes[0].scatter(y_actual[idx], y_pred[idx], alpha=0.25, s=8, color="#2563eb")
-    axes[0].plot(lims, lims, "r--", lw=1.8)
-    axes[0].set_xlabel("Actual"); axes[0].set_ylabel("Predicted"); axes[0].set_title(f"Scatter — R²={results.get(best_name, {}).get('R2', 0):.4f}")
-    axes[0].set_xlim(lims); axes[0].set_ylim(lims)
-    axes[0].grid(True, alpha=0.4)
-
-    axes[1].hist(residuals, bins=55, alpha=0.72, edgecolor="white", linewidth=0.3)
-    axes[1].axvline(0, color="#dc2626", lw=1.8, ls="--")
-    axes[1].axvline(residuals.mean(), color="#f59e0b", lw=1.5, ls=":")
-    axes[1].set_xlabel("Residual (Predicted − Actual) °C"); axes[1].set_title("Residual distribution")
-    axes[1].grid(True, alpha=0.4)
-
-    plt.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close()
-
-    col_r1, col_r2, col_r3 = st.columns(3)
-    col_r1.metric("Mean residual", f"{residuals.mean():.4f}°C")
-    col_r2.metric("Residual std", f"{residuals.std():.4f}°C")
-    col_r3.metric("Max abs residual", f"{np.abs(residuals).max():.2f}°C")
 
     st.divider()
 
-    # Random Forest feature importance
-    st.subheader("Random Forest feature importance")
-    fi_df = get_feature_importance(bundles)
-    def feature_group_colour(name):
-        if any(x in name for x in ("lag", "rolling")):
-            return "#14b8a6", "Lag / rolling"
-        elif any(x in name for x in ("sin", "cos", "season", "doy", "year")):
-            return "#f59e0b", "Temporal encoding"
-        else:
-            return "#2563eb", "Raw atmospheric"
-    fi_df["Colour"], fi_df["Group"] = zip(*fi_df["Feature"].apply(lambda f: feature_group_colour(f)))
-    fig, ax = plt.subplots(figsize=(11, 6))
-    bars = ax.barh(fi_df["Feature"][::-1], fi_df["Importance"][::-1], color=fi_df["Colour"][::-1].values, alpha=0.85)
-    ax.set_xlabel("Feature importance"); ax.set_title("Random Forest feature importance")
-    for bar, val in zip(bars, fi_df["Importance"][::-1].values):
-        ax.text(bar.get_width() + 0.001, bar.get_y() + bar.get_height() / 2, f"{val:.4f}", va="center", fontsize=7.5)
-    from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor="#14b8a6", label="Lag / rolling"), Patch(facecolor="#f59e0b", label="Temporal encoding"), Patch(facecolor="#2563eb", label="Raw atmospheric")]
-    ax.legend(handles=legend_elements, fontsize=9, framealpha=0)
-    ax.grid(True, axis="x", alpha=0.4)
-    plt.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close()
+    # Time-series cross-validation on training set
+    st.subheader("Five-fold time cross-validation (training set diagnostics)")
+    if bundles is None:
+        st.info("Trained model bundles not available. Retrain from the sidebar to compute time CV.")
+    else:
+        # Prepare a DF for CV: impute feature NaNs with median (same as training)
+        try:
+            df_cv = df_clean.copy().sort_values('date').reset_index(drop=True)
+            features_for_cv = [c for c in FEATURE_COLS if c in df_cv.columns]
+            if len(features_for_cv) == 0:
+                st.info("No features found for CV (check FEATURE_COLS).")
+            else:
+                X_raw = df_cv[features_for_cv]
+                imp = SimpleImputer(strategy="median")
+                X_imp = pd.DataFrame(imp.fit_transform(X_raw), columns=features_for_cv, index=df_cv.index)
+                df_cv[features_for_cv] = X_imp
 
-    top5 = fi_df.head(5)
-    st.caption("Top 5 features:")
-    for _, row in top5.iterrows():
-        st.caption(f"• {row['Feature']} ({row['Group']}) — {row['Importance']:.4f}")
+                # Now run CV — pass df_cv which has no NaNs in feature columns used
+                try:
+                    cv_results = time_series_cv(df_cv, bundles, n_splits=5)
+                    fold_fig, ax = plt.subplots(figsize=(9, 4))
+                    for name in MODEL_NAMES:
+                        df_cv_res = cv_results.get(name)
+                        if df_cv_res is None or df_cv_res.empty:
+                            continue
+                        st.markdown(f"**{name} — time CV summary**")
+                        st.table(df_cv_res[["fold", "MAE", "RMSE", "MAPE%", "R2"]].set_index("fold"))
+                        ax.plot(df_cv_res["fold"], df_cv_res["MAE"], marker="o", label=name, color=MODEL_COLORS.get(name))
+                    ax.set_xlabel("Fold"); ax.set_ylabel("MAE (°C)"); ax.set_title("Time CV — MAE by fold"); ax.grid(True, alpha=0.3); ax.legend()
+                    plt.tight_layout(); st.pyplot(fold_fig, use_container_width=True); plt.close()
+                except Exception as e:
+                    st.error("Time CV failed — see traceback for details.")
+                    st.text(traceback.format_exc())
+        except Exception as e:
+            st.error("Failed preparing data for time CV.")
+            st.text(traceback.format_exc())
 
-    st.info("Lag features are the most important; cyclical temporal encodings follow.")
+    st.divider()
+
+    # Predicted vs Actual — test set for available bundles
+    st.subheader("Predicted vs Actual — all models (test set)")
+    if bundles is None:
+        st.info("Trained model bundles not available. Retrain to see predicted vs actual plots.")
+    else:
+        try:
+            test_preds = get_test_predictions(bundles, df_clean)
+            fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
+            for ax, name in zip(axes.ravel(), MODEL_NAMES):
+                y_actual, y_pred, dates = test_preds.get(name, (np.array([]), np.array([]), np.array([])))
+                mask = ~(np.isnan(y_actual) | np.isnan(y_pred))
+                y_actual = np.asarray(y_actual)[mask]
+                y_pred = np.asarray(y_pred)[mask]
+                if len(y_actual) == 0:
+                    ax.text(0.5, 0.5, "No valid data", ha="center")
+                    continue
+                lims = [min(y_actual.min(), y_pred.min()) - 1, max(y_actual.max(), y_pred.max()) + 1]
+                ax.scatter(y_actual, y_pred, alpha=0.18, s=8, color=MODEL_COLORS.get(name))
+                ax.plot(lims, lims, "r--", lw=1.5)
+                ax.set_xlim(lims); ax.set_ylim(lims)
+                ax.set_xlabel("Actual"); ax.set_ylabel("Predicted"); ax.set_title(f"{name} — Pred vs Actual")
+                ax.grid(True, alpha=0.35)
+            plt.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close()
+        except Exception:
+            st.error("Failed to compute Pred vs Actual plots; see traceback.")
+            st.text(traceback.format_exc())
+
+        # Residual summaries
+        st.markdown("**Residual summary (test set)**")
+        cols = st.columns(3)
+        try:
+            for i, name in enumerate(MODEL_NAMES):
+                y_actual, y_pred, _ = test_preds.get(name, (np.array([]), np.array([]), np.array([])))
+                mask = ~(np.isnan(y_actual) | np.isnan(y_pred))
+                y_actual = np.asarray(y_actual)[mask]
+                y_pred = np.asarray(y_pred)[mask]
+                residuals = y_pred - y_actual if len(y_actual) else np.array([0.0])
+                with cols[i]:
+                    st.metric(f"{name} mean residual", f"{np.mean(residuals):.4f}°C")
+                    st.metric(f"{name} residual std", f"{np.std(residuals):.4f}°C")
+                    st.metric(f"{name} max abs residual", f"{np.max(np.abs(residuals)):.2f}°C")
+        except Exception:
+            st.text(traceback.format_exc())
+
+    st.divider()
+
+    # Model choices explanation
+    st.subheader("Why these models were chosen")
+    st.markdown("""
+    - **Linear Regression**: simple baseline parametric model and interpretable.
+    - **Decision Tree**: non-linear splits capturing thresholds.
+    - **Random Forest**: ensemble reducing variance and often the best out-of-the-box for tabular inputs.
+    """)
+    st.caption("Choose Random Forest as default when it consistently yields highest R² and lower MAE/MAPE across folds.")

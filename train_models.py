@@ -23,29 +23,52 @@ MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 
+def compute_mape(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(y_true) & np.isfinite(y_pred) & (np.abs(y_true) > 1e-8)
+    if not mask.any():
+        return float("nan")
+    return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100.0)
+
+
 def compute_metrics(y_true, y_pred):
+    if len(y_true) == 0:
+        return {"MAE": None, "RMSE": None, "R2": None, "MAPE%": None}
     mae = float(mean_absolute_error(y_true, y_pred))
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-    r2 = float(r2_score(y_true, y_pred))
-    return {"MAE": round(mae, 4), "RMSE": round(rmse, 4), "R2": round(r2, 4)}
+    try:
+        r2 = float(r2_score(y_true, y_pred))
+    except Exception:
+        r2 = float("nan")
+    mape = compute_mape(y_true, y_pred)
+    return {"MAE": round(mae, 4), "RMSE": round(rmse, 4), "R2": round(r2, 4) if np.isfinite(r2) else None, "MAPE%": round(mape, 3)}
 
 
 def compute_baselines(df, split_idx):
+    df = df.reset_index(drop=True)
     df_train = df.iloc[:split_idx]
     df_test = df.iloc[split_idx:]
-    y_test = df_test[TARGET_COL].values
+    y_test = df_test[TARGET_COL].values if TARGET_COL in df_test.columns else np.array([])
 
-    # Persistence baseline: yesterday's value
-    y_persist = df.iloc[split_idx - 1 : split_idx + len(df_test) - 1][TARGET_COL].values
-    n = min(len(y_test), len(y_persist))
-    mask = ~(np.isnan(y_test[:n]) | np.isnan(y_persist[:n]))
-    persist_m = compute_metrics(y_test[:n][mask], y_persist[:n][mask])
+    # Persistence baseline (lag-1) aligned to test rows using shift
+    df['persist'] = df[TARGET_COL].shift(1)
+    y_persist = df['persist'].iloc[split_idx:].values
+    # align and mask NaNs
+    mask = np.isfinite(y_test) & np.isfinite(y_persist)
+    if mask.any():
+        persist_m = compute_metrics(y_test[mask], y_persist[mask])
+    else:
+        persist_m = {"MAE": None, "RMSE": None, "R2": None, "MAPE%": None}
 
-    # Climatology baseline: monthly mean from training set
-    monthly_mean = df_train.groupby("month")[TARGET_COL].mean()
-    y_clim = df_test["month"].map(monthly_mean).values
-    clim_mask = ~(np.isnan(y_test) | np.isnan(y_clim))
-    clim_m = compute_metrics(y_test[clim_mask], y_clim[clim_mask])
+    # Climatology: monthly mean from training set (if month exists)
+    clim_m = {"MAE": None, "RMSE": None, "R2": None, "MAPE%": None}
+    if "month" in df.columns and len(df_train) > 0:
+        monthly_mean = df_train.groupby("month")[TARGET_COL].mean()
+        y_clim = df_test["month"].map(monthly_mean).values
+        mask2 = np.isfinite(y_test) & np.isfinite(y_clim)
+        if mask2.any():
+            clim_m = compute_metrics(y_test[mask2], y_clim[mask2])
 
     return {
         "Persistence (lag-1)": persist_m,
@@ -54,22 +77,17 @@ def compute_baselines(df, split_idx):
 
 
 def build_model_defs(hyperparams=None):
-    """Return a dict of model name -> instantiated model.
-    hyperparams should be a dict keyed by model name with param dicts.
-    """
     hp = hyperparams or {}
     lr_hp = hp.get("Linear Regression", {})
     dt_hp = hp.get("Decision Tree", {})
     rf_hp = hp.get("Random Forest", {})
 
     lr = LinearRegression(**lr_hp)
-
     dt = DecisionTreeRegressor(
         max_depth=dt_hp.get("max_depth", 8),
         min_samples_leaf=dt_hp.get("min_samples_leaf", 1),
         random_state=42,
     )
-
     rf = RandomForestRegressor(
         n_estimators=rf_hp.get("n_estimators", 100),
         max_depth=rf_hp.get("max_depth", 12),
@@ -86,44 +104,48 @@ def build_model_defs(hyperparams=None):
 
 
 def train_and_save(hyperparams=None, progress_callback=None):
-    """
-    Run the training pipeline. If hyperparams provided, use them.
-    progress_callback: function(percent:int, message:str) - optional.
-    Returns results dict on success.
-    """
     def _report(pct, msg):
         try:
             if progress_callback:
                 progress_callback(int(pct), str(msg))
         except Exception:
-            # silently ignore callback errors so training still runs
             pass
 
     _report(0, "Starting training pipeline...")
     df = load_data()
-    _report(5, f"Loaded data ({len(df):,} rows)")
+    if df is None or df.empty:
+        raise RuntimeError("No data loaded for training.")
 
-    # drop rows where target is missing
+    # Ensure target exists and drop rows where target is missing
+    if TARGET_COL not in df.columns:
+        raise KeyError(f"Target column '{TARGET_COL}' not found in dataset.")
     df = df.dropna(subset=[TARGET_COL]).reset_index(drop=True)
     n = len(df)
-    split = int(n * 0.8)
+    split = max(1, int(n * 0.8))
 
-    X = df[FEATURE_COLS].values
+    # Build feature matrix using only features that exist in df
+    features_present = [c for c in FEATURE_COLS if c in df.columns]
+    if len(features_present) == 0:
+        # fall back: use all numeric columns except target and date
+        features_present = [c for c in df.select_dtypes(include=[np.number]).columns.tolist() if c not in [TARGET_COL]]
+
+    X_raw = df[features_present].values
     y = df[TARGET_COL].values
 
     _report(10, "Imputing missing values (median)...")
     imputer = SimpleImputer(strategy="median")
-    X_imp = imputer.fit_transform(X)
+    X_imp = imputer.fit_transform(X_raw)
 
+    # split after imputation so the imputer is fit on full data (consistent with CV)
     X_train, X_test = X_imp[:split], X_imp[split:]
     y_train, y_test = y[:split], y[split:]
 
-    _report(15, "Scaling features for linear model...")
+    _report(20, "Scaling features for linear model...")
     scaler = StandardScaler()
     X_train_sc = scaler.fit_transform(X_train)
     X_test_sc = scaler.transform(X_test)
 
-    _report(20, "Computing baseline metrics...")
+    _report(25, "Computing baseline metrics...")
     baselines = compute_baselines(df, split)
     with open(os.path.join(MODELS_DIR, "baselines.json"), "w") as f:
         json.dump(baselines, f, indent=2)
@@ -137,9 +159,9 @@ def train_and_save(hyperparams=None, progress_callback=None):
 
     model_names = list(model_defs.keys())
     n_models = len(model_names)
-    # allocate progress window 35..85 for model training/evaluation
     start_pct = 35
     end_pct = 85
+
     for i, (name, model) in enumerate(model_defs.items(), start=1):
         pct_start = start_pct + (i - 1) * (end_pct - start_pct) / n_models
         pct_end = start_pct + i * (end_pct - start_pct) / n_models
@@ -148,31 +170,33 @@ def train_and_save(hyperparams=None, progress_callback=None):
         Xtr = X_train_sc if use_scaler else X_train
         Xte = X_test_sc if use_scaler else X_test
 
+        # fit model (Xtr, y_train should have no NaNs)
         model.fit(Xtr, y_train)
-        # small sleep to make progress visible when called from UI
-        time.sleep(0.2)
+        time.sleep(0.15)
 
         y_pred = model.predict(Xte)
         m = compute_metrics(y_test, y_pred)
         results[name] = m
 
-        if m["R2"] > best_r2:
+        if (m.get("R2") is not None) and (m["R2"] > best_r2):
             best_r2 = m["R2"]
             best_name = name
 
+        # Save bundle: include imputer & scaler for consistent preprocessing at inference time
         bundles[name] = {
             "model": model,
             "scaler": scaler if use_scaler else None,
             "imputer": imputer,
-            "features": FEATURE_COLS,
+            "features": features_present,
             "use_scaler": use_scaler,
             "target": TARGET_COL,
         }
 
-        _report(pct_end - 1, f"Evaluated {name}: MAE={m['MAE']:.3f}, RMSE={m['RMSE']:.3f}, R²={m['R2']:.4f}")
+        _report(pct_end - 1, f"Evaluated {name}: MAE={m.get('MAE')}, RMSE={m.get('RMSE')}, R²={m.get('R2')}, MAPE%={m.get('MAPE%')}")
 
     results["best_model"] = best_name
-    _report(90, f"Best model: {best_name} (R²={best_r2:.4f})")
+    results["timestamp"] = pd.Timestamp.now().isoformat()
+    _report(90, f"Best model: {best_name} (R²={best_r2:.4f})" if best_name else "No best model")
 
     _report(92, "Saving model bundles and results...")
     joblib.dump(bundles, os.path.join(MODELS_DIR, "trained_models.pkl"))
@@ -180,7 +204,7 @@ def train_and_save(hyperparams=None, progress_callback=None):
         json.dump(results, f, indent=2)
 
     _report(98, "Finalising and cleaning up...")
-    time.sleep(0.2)
+    time.sleep(0.1)
     _report(100, "Training complete")
     return results
 

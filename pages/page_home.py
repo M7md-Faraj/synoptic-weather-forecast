@@ -1,182 +1,96 @@
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-from utils.data_loader import MONTH_LABELS
 
+from utils.data_loader import MONTH_LABELS
+from utils.model_utils import load_results, MODEL_COLORS, MODEL_NAMES, get_feature_importance
+
+def _pipeline_markdown():
+    return """
+    **Data processing pipeline — high level**
+
+    1. **Load & Inspect** — raw station observations, basic checks (missing values, units).
+    2. **Clean** — fill or impute missing values (snow depth → 0, others → median), convert units.
+    3. **Engineer** — calendar features, cyclical encodings, lag-1/lag-7, 7-day rolling means and sums.
+    4. **Split (chronological)** — 80% train / 20% test (no shuffle) to avoid leakage.
+    5. **Train & Validate** — train LR, Decision Tree, Random Forest. Compare against baselines (persistence, climatology).
+    6. **Time CV (diagnostic)** — 5-fold time-slices across the training set to check stability of skill.
+    7. **Evaluate** — use MAE, RMSE, MAPE%, R² and residual diagnostics.
+    8. **Forecast** — build climatological/feature-based forecast input and produce day-by-day predictions.
+    9. **Communicate** — make scope, limitations and uncertainty explicit before sharing forecasts.
+    """
 
 def render(df):
-
-    # ---------------------------------------------------------
-    # PAGE TITLE
-    # ---------------------------------------------------------
-    st.title("London Daily Temperature Analysis")
-    st.write(
-        "Interactive dashboard exploring historical temperature patterns "
-        "and evaluating machine learning models for temperature prediction."
-    )
-
+    st.title("London Daily Temperature Analysis — Home")
+    st.write("Overview and pipeline for the project — how the dataset is transformed from raw observations to model predictions.")
     st.divider()
 
-    # ---------------------------------------------------------
-    # PROJECT OBJECTIVE
-    # ---------------------------------------------------------
-    st.subheader("Project Overview")
-
-    st.markdown("""
-    This project investigates how different machine learning algorithms perform 
-    when predicting **daily mean temperature** using historical climate data.
-
-    The models compared in this study include:
-
-    • Linear Regression  
-    • Decision Tree Regressor  
-    • Random Forest Regressor  
-
-    Key objectives:
-
-    1. Evaluate whether machine learning models outperform simple baselines.
-    2. Compare model generalisation performance.
-    3. Identify which input variables contribute most to prediction accuracy.
-    """)
-
+    # Pipeline
+    st.subheader("Project pipeline")
+    st.markdown(_pipeline_markdown())
     st.divider()
 
-    # ---------------------------------------------------------
-    # DATASET SUMMARY
-    # ---------------------------------------------------------
-    st.subheader("Dataset Information")
-
+    # Dataset summary metrics
+    st.subheader("Dataset snapshot")
     col1, col2, col3, col4 = st.columns(4)
-
     col1.metric("Total Records", f"{len(df):,}")
-    col2.metric("Observation Period", "1979 – 2020")
+    col2.metric("Observation Period", f"{df['date'].min().date()} → {df['date'].max().date()}")
     col3.metric("Original Variables", "9")
     col4.metric("Derived Variables", "18")
-
-    st.markdown(
-        "The dataset consists of **daily meteorological observations from Heathrow Airport**, "
-        "providing a consistent long-term station record for London."
-    )
+    st.caption("Data from Heathrow long-term station record used for proof-of-concept forecasting.")
 
     st.divider()
 
-    # ---------------------------------------------------------
-    # DATA PREVIEW
-    # ---------------------------------------------------------
-    st.subheader("Sample of Dataset")
+    # Best model snapshot (from results.json)
+    st.subheader("Best model snapshot")
+    results = load_results()
+    best = results.get("best_model", "Random Forest")
+    best_metrics = results.get(best, {})
+    st.markdown(f"**Best model (test set):** {best}")
+    st.write(f"MAE: {best_metrics.get('MAE', 'N/A')} °C · RMSE: {best_metrics.get('RMSE', 'N/A')} °C · MAPE: {best_metrics.get('MAPE%', 'N/A')}% · R²: {best_metrics.get('R2', 'N/A')}")
+    st.caption("Snapshot from the last training run — this helps viewers quickly see which model performed best on the reserved test set.")
+    st.divider()
 
-    st.dataframe(df.head(), use_container_width=True)
+    # Feature engineering summary (linked to EDA)
+    st.subheader("Feature engineering — groups and rationale")
+    st.markdown("""
+    **Why these groups were included**:
+
+    - **Raw atmospheric**: observations (temperature extremes, radiation, pressure, precipitation). These are the immediate physical drivers of daily mean temperature.
+    - **Cyclical encodings**: month/day-of-year encoded with sin/cos to capture seasonality without discontinuities.
+    - **Calendar / ordinal**: year and day-of-year to allow long-term trends and coarse seasonality.
+    - **Lag & rolling**: lag-1, lag-7 and 7-day rolling statistics capture persistence and short-term memory in the time series — this was the single strongest signal in EDA.
+    """)
+    st.caption("See the EDA page for the correlation heatmap and distribution plots that motivated each group.")
+
+    # quick feature importance preview (top 5)
+    try:
+        fi_df = get_feature_importance(__import__("utils.model_utils", fromlist=["load_model_bundles"]).load_model_bundles())
+        st.markdown("**Top feature importance (Random Forest)**")
+        top5 = fi_df.head(5)
+        for _, r in top5.iterrows():
+            st.write(f"- {r['Feature']}: importance {r['Importance']:.4f}")
+    except Exception:
+        st.info("Feature importance not available (models not trained). Retrain models from the sidebar to see feature importances here.")
 
     st.divider()
 
-    # ---------------------------------------------------------
-    # ANNUAL TEMPERATURE TREND
-    # ---------------------------------------------------------
-    st.subheader("Long-Term Temperature Trend (1979–2020)")
+    # Scope & Limitations
+    st.subheader("Scope & limitations")
+    st.markdown("""
+    **Scope**
+    - Short-range climatological forecasts of daily mean temperature for London Heathrow based on historical station records and engineered features.
+    - Designed as a research prototype rather than an operational weather forecast.
 
-    annual = df.groupby("year")["mean_temp"].mean()
-    trend = np.polyfit(annual.index, annual.values, 1)
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-
-    ax.fill_between(annual.index, annual.values, alpha=0.15)
-
-    ax.plot(
-        annual.index,
-        annual.values,
-        marker="o",
-        ms=3.5,
-        lw=2,
-        label="Annual Mean Temperature",
-    )
-
-    ax.plot(
-        annual.index,
-        np.polyval(trend, annual.index),
-        "--",
-        color="#dc2626",
-        lw=2,
-        label=f"Trend: +{trend[0]*10:.2f}°C per decade",
-    )
-
-    ax.set_xlabel("Year")
-    ax.set_ylabel("Mean Temperature (°C)")
-    ax.grid(True, alpha=0.4)
-    ax.legend(fontsize=9)
-
-    plt.tight_layout()
-    st.pyplot(fig, use_container_width=True)
-    plt.close()
-
-    st.caption(
-        f"Estimated warming over the full study period: "
-        f"{trend[0]*(2020-1979):.1f}°C."
-    )
+    **Limitations & sources of uncertainty**
+    - **Climatological inputs for forecasts**: When live atmospheric inputs are unavailable we use monthly medians — this reduces temporal fidelity.
+    - **Station-only observations**: single-station biases exist and do not capture spatial fields (advection, frontal passages).
+    - **Model uncertainty**: residuals and error bands (MAE, RMSE, MAPE%) reflect model limitations. Extreme events and abrupt changes will be harder to predict.
+    - **Data quality**: missing values and measurement changes across decades can introduce biases; imputation reduces but does not eliminate these.
+    """)
+    st.caption("Always present forecast uncertainty and avoid overconfidence when publishing results.")
 
     st.divider()
-
-    # ---------------------------------------------------------
-    # MONTHLY CLIMATE PATTERN
-    # ---------------------------------------------------------
-    st.subheader("Average Monthly Temperature Pattern")
-
-    monthly = df.groupby("month")["mean_temp"].mean()
-
-    colours = [
-        "#3b82f6" if t < 8 else "#f59e0b" if t > 16 else "#14b8a6"
-        for t in monthly.values
-    ]
-
-    fig2, ax2 = plt.subplots(figsize=(10, 4))
-
-    bars = ax2.bar(
-        MONTH_LABELS,
-        monthly.values,
-        color=colours,
-        width=0.65,
-        alpha=0.9,
-    )
-
-    ax2.set_xlabel("Month")
-    ax2.set_ylabel("Mean Temperature (°C)")
-    ax2.grid(True, axis="y", alpha=0.4)
-
-    for bar, val in zip(bars, monthly.values):
-        ax2.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + 0.2,
-            f"{val:.1f}°",
-            ha="center",
-            fontsize=8.5,
-        )
-
-    plt.tight_layout()
-    st.pyplot(fig2, use_container_width=True)
-    plt.close()
-
-    st.caption(
-        "London exhibits strong seasonal variation. "
-        "Because of this cyclic pattern, temporal variables such as month "
-        "are encoded using cyclical transformations for machine learning models."
-    )
-
-    st.divider()
-
-    # ---------------------------------------------------------
-    # TEMPERATURE DISTRIBUTION
-    # ---------------------------------------------------------
-    st.subheader("Temperature Distribution")
-
-    fig3, ax3 = plt.subplots(figsize=(8, 4))
-
-    ax3.hist(df["mean_temp"], bins=40, alpha=0.8)
-
-    ax3.set_xlabel("Temperature (°C)")
-    ax3.set_ylabel("Frequency")
-    ax3.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    st.pyplot(fig3)
-    plt.close()
-
-    st.caption("Histogram showing the distribution of daily mean temperatures.")
+    st.markdown("#### Quick actions")
+    st.markdown("- Use the **Models** page to check baselines and time CV for model stability.\n- Use **Forecast** page to generate one-day or multi-day forecasts across models.")
